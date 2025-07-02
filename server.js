@@ -1,7 +1,7 @@
 /*
     * AQUORIX Pro Backend Server
     * Description: Express server for AQUORIX Pro Dashboard, providing health check and Supabase PostgreSQL connectivity
-    * Version: 1.0.4
+    * Version: 1.0.5
     * Author: Larrym
     * Date: 2025-07-03
     * Change Log:
@@ -12,6 +12,7 @@
     *   - 2025-07-03: Added GET /api/users endpoint for CRUD operations (v1.0.2)
     *   - 2025-07-03: Added POST /api/sensors endpoint for CRUD operations (v1.0.3)
     *   - 2025-07-03: Added GET /api/alerts endpoint for CRUD operations (v1.0.4)
+    *   - 2025-07-03: Added error handling to /api/health endpoint (v1.0.5)
     */
 
    const express = require('express'); // Express: Like PHP's Laravel for routing HTTP requests
@@ -42,8 +43,16 @@
    app.use(express.json()); // Parse JSON requests, like PHP's json_decode
 
    // Health check endpoint, like a PHP endpoint returning JSON
-   app.get('/api/health', (req, res) => {
-     res.json({ status: 'healthy' });
+   app.get('/api/health', async (req, res) => {
+     try {
+       const client = await pool.connect();
+       await client.query('SELECT 1'); // Simple query to test DB connection
+       client.release();
+       res.json({ status: 'healthy', dbConnected: true });
+     } catch (err) {
+       console.error('Health check failed:', err.stack);
+       res.status(500).json({ status: 'unhealthy', dbConnected: false, error: err.message });
+     }
    });
 
    // Get all users, like a PHP script with SELECT query
