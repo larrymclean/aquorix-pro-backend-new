@@ -101,6 +101,18 @@
      }
    });
 
+app.get('/api/sensors', async (req, res) => {
+  try {
+    const client = await pool.connect();
+    const result = await client.query('SELECT sensor_id, dive_id, temperature, depth, timestamp FROM sensor_data');
+    client.release();
+    res.json(result.rows);
+    } catch (err) {
+      console.error('Error fetching sensor data:', err.stack);
+      res.status(500).json({ error: 'Failed to fetch sensor data' });
+    }
+  });
+
    app.listen(port, () => {
      console.log(`AQUORIX Pro Backend running at http://localhost:${port}`); // Start server, like PHP's built-in server
    });
