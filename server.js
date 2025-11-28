@@ -112,44 +112,6 @@ app.get('/api/users/by-supabase-id/:supabase_user_id', async (req, res) => {
 
 // Fix RequireAuth → adds missing /api/users/me endpoint
 app.get('/api/users/me', async (req, res) => {
-});
-
-// Update onboarding step + metadata
-app.post('/api/users/update-step', async (req, res) => {
-  const { supabase_user_id, step, metadata } = req.body;
-
-  if (!supabase_user_id || !step) {
-    return res.status(400).json({ error: 'supabase_user_id and step are required' });
-  }
-
-  try {
-    const client = await pool.connect();
-
-    // Update onboarding_metadata JSONB in pro_profiles
-    await client.query(
-      `
-      UPDATE aquorix.pro_profiles
-      SET onboarding_metadata = jsonb_set(
-        onboarding_metadata::jsonb,
-        '{current_step}',
-        to_jsonb($2::int),
-        true
-      ) || $3::jsonb
-      FROM aquorix.users u
-      WHERE pro_profiles.user_id = u.user_id
-        AND u.supabase_user_id = $1
-      `,
-      [supabase_user_id, step, metadata ? JSON.stringify(metadata) : '{}']
-    );
-
-    client.release();
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('Error updating onboarding step:', err);
-    res.status(500).json({ error: 'Failed to update onboarding step' });
-  }
-});
-
   const { user_id } = req.query;
   if (!user_id) {
     return res.status(400).json({ error: 'user_id required' });
@@ -188,6 +150,42 @@ app.post('/api/users/update-step', async (req, res) => {
   }
 });
 
+
+// Update onboarding step + metadata
+app.post('/api/users/update-step', async (req, res) => {
+  const { supabase_user_id, step, metadata } = req.body;
+
+  if (!supabase_user_id || !step) {
+    return res.status(400).json({ error: 'supabase_user_id and step are required' });
+  }
+
+  try {
+    const client = await pool.connect();
+
+    // Update onboarding_metadata JSONB in pro_profiles
+    await client.query(
+      `
+      UPDATE aquorix.pro_profiles
+      SET onboarding_metadata = jsonb_set(
+        onboarding_metadata::jsonb,
+        '{current_step}',
+        to_jsonb($2::int),
+        true
+      ) || $3::jsonb
+      FROM aquorix.users u
+      WHERE pro_profiles.user_id = u.user_id
+        AND u.supabase_user_id = $1
+      `,
+      [supabase_user_id, step, metadata ? JSON.stringify(metadata) : '{}']
+    );
+
+    client.release();
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Error updating onboarding step:', err);
+    res.status(500).json({ error: 'Failed to update onboarding step' });
+  }
+});
 
 // Insert sensor data, like a PHP script with INSERT query
 app.post('/api/sensors', async (req, res) => {
