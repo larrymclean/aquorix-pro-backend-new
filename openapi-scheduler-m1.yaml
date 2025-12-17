@@ -1,0 +1,1097 @@
+openapi: 3.0.3
+
+info:
+  title: AQUORIX Scheduler API
+  version: 1.0.1-m1-approved
+  description: |
+    Milestone 1 (MVP) Scheduler API for operator-scoped scheduling, booking intake,
+    confirmation workflow, roster/capacity views, and a DB-backed notifications queue.
+
+    Canon decisions (APPROVED):
+    - Base path: /api/v1/operators/{operator_id}/...
+    - Operator-scoped endpoints MUST enforce operator_id isolation.
+    - Capacity exposes BOTH pending + confirmed headcounts, plus two availability interpretations.
+    - Public booking intake auto-creates/assigns a guest diver when diver_id is not provided (MVP frictionless).
+    - itinerary_id is derived from session_id where applicable (intake does not require itinerary_id).
+    - Include audit timestamps where present (created_at, updated_at, confirmed_at, cancelled_at).
+
+    v1.0.1 hardening (non-breaking):
+    - Add pagination query parameters (limit, offset) on list endpoints.
+    - Document public intake rate limiting + add 429 response shape.
+
+servers:
+  - url: https://api.aquorix.pro
+    description: Production
+  - url: http://localhost:3001
+    description: Local dev
+
+tags:
+  - name: Health
+  - name: Operators
+  - name: Sessions
+  - name: Bookings
+  - name: Vessels
+  - name: Capacity
+  - name: Notifications
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    OperatorId:
+      name: operator_id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+      example: 139
+
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+      example: 123
+
+    BookingId:
+      name: booking_id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+      example: 456
+
+    DateISO:
+      name: date
+      in: query
+      required: false
+      schema:
+        type: string
+        format: date
+      example: "2025-12-18"
+
+    WeekStartISO:
+      name: start
+      in: query
+      required: false
+      description: Start date (inclusive) for week view. Defaults to today in operator timezone.
+      schema:
+        type: string
+        format: date
+      example: "2025-12-15"
+
+    BookingStatus:
+      name: booking_status
+      in: query
+      required: false
+      schema:
+        type: string
+        description: Booking status enum is DB-defined. API treats as string.
+        example: pending
+
+    PaymentStatus:
+      name: payment_status
+      in: query
+      required: false
+      schema:
+        type: string
+        description: Payment status enum is DB-defined. API treats as string.
+        example: unpaid
+
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        default: 50
+        minimum: 1
+        maximum: 100
+      description: Max results to return (default 50, max 100).
+
+    Offset:
+      name: offset
+      in: query
+      required: false
+      schema:
+        type: integer
+        default: 0
+        minimum: 0
+      description: Offset into result set for pagination.
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+      required: [error]
+
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        version:
+          type: string
+          example: 1.0.1-m1-approved
+        timestamp:
+          type: string
+          format: date-time
+      required: [status, timestamp]
+
+    OperatorSummary:
+      type: object
+      properties:
+        operator_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        destination_id:
+          type: integer
+          format: int64
+          nullable: true
+        timezone:
+          type: string
+          example: Asia/Amman
+        default_currency:
+          type: string
+          example: JOD
+        overdue_threshold_hours:
+          type: integer
+          example: 24
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+      required: [operator_id, name]
+
+    VesselSummary:
+      type: object
+      properties:
+        vessel_id:
+          type: integer
+          format: int64
+        operator_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        vessel_type:
+          type: string
+          nullable: true
+        max_capacity:
+          type: integer
+          nullable: true
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+      required: [vessel_id, name]
+
+    SessionCapacity:
+      type: object
+      properties:
+        max_capacity:
+          type: integer
+          nullable: true
+          description: Derived from vessel.max_capacity when vessel_id is present.
+        confirmed_headcount:
+          type: integer
+          description: SUM(headcount) where booking_status='confirmed' (or your DB confirmed value).
+        pending_headcount:
+          type: integer
+          description: SUM(headcount) where booking_status='pending' (or your DB pending value).
+        available_if_confirmed_only:
+          type: integer
+          nullable: true
+          description: max_capacity - confirmed_headcount
+        available_if_pending_reserved:
+          type: integer
+          nullable: true
+          description: max_capacity - (confirmed_headcount + pending_headcount)
+        is_over_capacity_confirmed_only:
+          type: boolean
+        is_over_capacity_with_pending:
+          type: boolean
+      required:
+        - confirmed_headcount
+        - pending_headcount
+        - is_over_capacity_confirmed_only
+        - is_over_capacity_with_pending
+
+    SessionSummary:
+      type: object
+      properties:
+        session_id:
+          type: integer
+          format: int64
+        operator_id:
+          type: integer
+          format: int64
+        itinerary_id:
+          type: integer
+          format: int64
+          nullable: true
+        team_id:
+          type: integer
+          format: int64
+          nullable: true
+        dive_site_id:
+          type: integer
+          format: int64
+          nullable: true
+        vessel_id:
+          type: integer
+          format: int64
+          nullable: true
+        session_type:
+          type: string
+          example: boat
+        dive_datetime:
+          type: string
+          format: date-time
+        meet_time:
+          type: string
+          format: date-time
+          nullable: true
+        max_depth:
+          type: integer
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+        capacity:
+          $ref: "#/components/schemas/SessionCapacity"
+      required: [session_id, dive_datetime, operator_id]
+
+    BookingSummary:
+      type: object
+      properties:
+        booking_id:
+          type: integer
+          format: int64
+        operator_id:
+          type: integer
+          format: int64
+        itinerary_id:
+          type: integer
+          format: int64
+          description: Not-null in DB. For public intake, server derives from session_id.
+        session_id:
+          type: integer
+          format: int64
+          nullable: true
+        diver_id:
+          type: integer
+          format: int64
+          description: Not-null in DB. For public intake, server creates/assigns guest diver if omitted.
+        booking_status:
+          type: string
+        payment_status:
+          type: string
+        headcount:
+          type: integer
+          default: 1
+        guest_name:
+          type: string
+          nullable: true
+        guest_email:
+          type: string
+          format: email
+          nullable: true
+        guest_phone:
+          type: string
+          nullable: true
+        certification_level:
+          type: string
+          nullable: true
+        special_requests:
+          type: string
+          nullable: true
+        source:
+          type: string
+          nullable: true
+        confirmed_at:
+          type: string
+          format: date-time
+          nullable: true
+        cancelled_at:
+          type: string
+          format: date-time
+          nullable: true
+        cancellation_reason:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+        - booking_id
+        - operator_id
+        - itinerary_id
+        - diver_id
+        - booking_status
+        - payment_status
+        - created_at
+
+    CreateSessionRequest:
+      type: object
+      properties:
+        itinerary_id:
+          type: integer
+          format: int64
+        team_id:
+          type: integer
+          format: int64
+        dive_site_id:
+          type: integer
+          format: int64
+        dive_datetime:
+          type: string
+          format: date-time
+        meet_time:
+          type: string
+          format: date-time
+          nullable: true
+        vessel_id:
+          type: integer
+          format: int64
+          nullable: true
+        session_type:
+          type: string
+          enum: [shore, boat, boat_charter]
+          default: shore
+        max_depth:
+          type: integer
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+      required: [itinerary_id, dive_datetime]
+
+    UpdateSessionRequest:
+      type: object
+      properties:
+        team_id:
+          type: integer
+          format: int64
+          nullable: true
+        dive_site_id:
+          type: integer
+          format: int64
+          nullable: true
+        dive_datetime:
+          type: string
+          format: date-time
+          nullable: true
+        meet_time:
+          type: string
+          format: date-time
+          nullable: true
+        vessel_id:
+          type: integer
+          format: int64
+          nullable: true
+        session_type:
+          type: string
+          enum: [shore, boat, boat_charter]
+          nullable: true
+        max_depth:
+          type: integer
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+
+    PublicBookingIntakeRequest:
+      type: object
+      description: |
+        Public booking intake (no auth). Server MUST:
+        - validate operator_id owns session_id
+        - derive itinerary_id from session_id (via dive_sessions.itinerary_id)
+        - if diver_id is null/omitted, auto-create or assign a guest diver record
+        - create booking in pending state
+      properties:
+        operator_id:
+          type: integer
+          format: int64
+        session_id:
+          type: integer
+          format: int64
+        diver_id:
+          type: integer
+          format: int64
+          nullable: true
+        headcount:
+          type: integer
+          default: 1
+          minimum: 1
+        guest_name:
+          type: string
+        guest_email:
+          type: string
+          format: email
+        guest_phone:
+          type: string
+          nullable: true
+        certification_level:
+          type: string
+          nullable: true
+        special_requests:
+          type: string
+          nullable: true
+        source:
+          type: string
+          default: website
+      required: [operator_id, session_id, guest_name, guest_email]
+
+    ConfirmBookingRequest:
+      type: object
+      properties:
+        payment_status:
+          type: string
+          nullable: true
+        payment_amount:
+          type: number
+          format: double
+          nullable: true
+        payment_currency:
+          type: string
+          nullable: true
+          example: JOD
+        payment_method:
+          type: string
+          nullable: true
+        payment_notes:
+          type: string
+          nullable: true
+
+    DeclineBookingRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          nullable: true
+
+    UpdatePaymentRequest:
+      type: object
+      description: Operator updates payment fields without changing booking_status (unless your implementation chooses to).
+      properties:
+        payment_status:
+          type: string
+        payment_amount:
+          type: number
+          format: double
+          nullable: true
+        payment_currency:
+          type: string
+          nullable: true
+        payment_method:
+          type: string
+          nullable: true
+        payment_notes:
+          type: string
+          nullable: true
+      required: [payment_status]
+
+    DashboardSnapshot:
+      type: object
+      properties:
+        operator_id:
+          type: integer
+        date:
+          type: string
+          format: date
+        timezone:
+          type: string
+        stats:
+          type: object
+          properties:
+            total_sessions:
+              type: integer
+            pending_requests:
+              type: integer
+            overdue_payments:
+              type: integer
+            at_capacity_confirmed_only:
+              type: integer
+            at_capacity_with_pending:
+              type: integer
+          required:
+            - total_sessions
+            - pending_requests
+            - overdue_payments
+            - at_capacity_confirmed_only
+            - at_capacity_with_pending
+        next_departure:
+          type: object
+          nullable: true
+          properties:
+            session_id:
+              type: integer
+            dive_datetime:
+              type: string
+              format: date-time
+            vessel_name:
+              type: string
+              nullable: true
+            confirmed_headcount:
+              type: integer
+            pending_headcount:
+              type: integer
+      required: [operator_id, date, stats]
+
+    OverdueBooking:
+      type: object
+      properties:
+        booking_id:
+          type: integer
+        session_id:
+          type: integer
+        guest_name:
+          type: string
+          nullable: true
+        guest_email:
+          type: string
+          format: email
+          nullable: true
+        payment_status:
+          type: string
+        hours_until_dive:
+          type: number
+          format: double
+        requires_reminder:
+          type: boolean
+      required: [booking_id, session_id, payment_status, hours_until_dive, requires_reminder]
+
+    NotificationCreateRequest:
+      type: object
+      properties:
+        recipient_type:
+          type: string
+          enum: [operator, guest, staff, admin]
+        recipient_id:
+          type: integer
+          format: int64
+          nullable: true
+        recipient_email:
+          type: string
+          format: email
+        event_type:
+          type: string
+          example: booking_request
+        subject:
+          type: string
+          nullable: true
+        body:
+          type: string
+          nullable: true
+        booking_id:
+          type: integer
+          format: int64
+          nullable: true
+        session_id:
+          type: integer
+          format: int64
+          nullable: true
+        operator_id:
+          type: integer
+          format: int64
+          nullable: true
+      required: [recipient_type, recipient_email, event_type]
+
+paths:
+  /api/health:
+    get:
+      tags: [Health]
+      security: []
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+  /api/v1/destinations/{destination_id}/operators:
+    get:
+      tags: [Operators]
+      summary: List operators in a destination (e.g., Aqaba destination_id=19)
+      parameters:
+        - name: destination_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+          example: 19
+      responses:
+        "200":
+          description: Operators
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  destination_id:
+                    type: integer
+                  operators:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/OperatorSummary"
+                required: [destination_id, operators]
+
+  /api/v1/operators/{operator_id}/schedule/today:
+    get:
+      tags: [Sessions]
+      summary: Get today's sessions for an operator (with capacity rollups)
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+      responses:
+        "200":
+          description: Today schedule
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  operator_id:
+                    type: integer
+                  date:
+                    type: string
+                    format: date
+                  timezone:
+                    type: string
+                  sessions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SessionSummary"
+                required: [operator_id, date, sessions]
+
+  /api/v1/operators/{operator_id}/schedule/week:
+    get:
+      tags: [Sessions]
+      summary: Get 7-day schedule for an operator (with capacity rollups)
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+        - $ref: "#/components/parameters/WeekStartISO"
+      responses:
+        "200":
+          description: Week schedule
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  operator_id:
+                    type: integer
+                  start:
+                    type: string
+                    format: date
+                  end:
+                    type: string
+                    format: date
+                  timezone:
+                    type: string
+                  sessions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SessionSummary"
+                required: [operator_id, start, end, sessions]
+
+  /api/v1/operators/{operator_id}/dashboard/today:
+    get:
+      tags: [Sessions]
+      summary: Today's operational snapshot (counts + next departure)
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+      responses:
+        "200":
+          description: Dashboard snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardSnapshot"
+
+  /api/v1/operators/{operator_id}/overdue:
+    get:
+      tags: [Bookings]
+      summary: Bookings entering overdue window (unpaid/deposit inside overdue_threshold_hours)
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Overdue bookings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  operator_id:
+                    type: integer
+                  overdue_threshold_hours:
+                    type: integer
+                  overdue_bookings:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/OverdueBooking"
+                required: [operator_id, overdue_threshold_hours, overdue_bookings]
+
+  /api/v1/operators/{operator_id}/sessions:
+    post:
+      tags: [Sessions]
+      summary: Create a session (operator-scoped)
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSessionRequest"
+      responses:
+        "201":
+          description: Created session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionSummary"
+
+  /api/v1/operators/{operator_id}/sessions/{session_id}:
+    get:
+      tags: [Sessions]
+      summary: Get session detail (includes roster + capacity)
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: Session detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session:
+                    $ref: "#/components/schemas/SessionSummary"
+                  vessel:
+                    $ref: "#/components/schemas/VesselSummary"
+                  roster:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/BookingSummary"
+                required: [session, roster]
+    patch:
+      tags: [Sessions]
+      summary: Update a session (minimal fields)
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+        - $ref: "#/components/parameters/SessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateSessionRequest"
+      responses:
+        "200":
+          description: Updated session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionSummary"
+
+  /api/v1/operators/{operator_id}/sessions/{session_id}/capacity:
+    get:
+      tags: [Capacity]
+      summary: Capacity rollup for a session (confirmed vs pending + two availability interpretations)
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: Capacity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id:
+                    type: integer
+                  operator_id:
+                    type: integer
+                  capacity:
+                    $ref: "#/components/schemas/SessionCapacity"
+                required: [session_id, operator_id, capacity]
+
+  /api/v1/operators/{operator_id}/sessions/{session_id}/roster:
+    get:
+      tags: [Bookings]
+      summary: Roster for a session
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+        - $ref: "#/components/parameters/SessionId"
+        - name: include_pending
+          in: query
+          schema:
+            type: boolean
+            default: true
+      responses:
+        "200":
+          description: Roster list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id:
+                    type: integer
+                  operator_id:
+                    type: integer
+                  roster:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/BookingSummary"
+                required: [session_id, operator_id, roster]
+
+  /api/v1/operators/{operator_id}/bookings/pending:
+    get:
+      tags: [Bookings]
+      summary: Pending booking requests queue
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Pending bookings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  operator_id:
+                    type: integer
+                  pending:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/BookingSummary"
+                required: [operator_id, pending]
+
+  /api/v1/operators/{operator_id}/bookings:
+    get:
+      tags: [Bookings]
+      summary: List bookings for an operator (with filters)
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+        - $ref: "#/components/parameters/DateISO"
+        - $ref: "#/components/parameters/BookingStatus"
+        - $ref: "#/components/parameters/PaymentStatus"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+        - name: session_id
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Bookings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  operator_id:
+                    type: integer
+                  bookings:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/BookingSummary"
+                required: [operator_id, bookings]
+
+  /api/v1/operators/{operator_id}/bookings/{booking_id}/confirm:
+    post:
+      tags: [Bookings]
+      summary: Confirm a booking (capacity-safe; uses operator's capacity policy but returns both counts)
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+        - $ref: "#/components/parameters/BookingId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConfirmBookingRequest"
+      responses:
+        "200":
+          description: Confirmed booking
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingSummary"
+        "409":
+          description: Capacity conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/operators/{operator_id}/bookings/{booking_id}/decline:
+    post:
+      tags: [Bookings]
+      summary: Decline a pending booking request
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+        - $ref: "#/components/parameters/BookingId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeclineBookingRequest"
+      responses:
+        "200":
+          description: Declined booking
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingSummary"
+
+  /api/v1/operators/{operator_id}/bookings/{booking_id}/payment:
+    patch:
+      tags: [Bookings]
+      summary: Update payment fields for a booking (operator action)
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+        - $ref: "#/components/parameters/BookingId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdatePaymentRequest"
+      responses:
+        "200":
+          description: Updated booking payment
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingSummary"
+
+  /api/v1/operators/{operator_id}/vessels:
+    get:
+      tags: [Vessels]
+      summary: List vessels for an operator
+      parameters:
+        - $ref: "#/components/parameters/OperatorId"
+      responses:
+        "200":
+          description: Vessels
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  operator_id:
+                    type: integer
+                  vessels:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/VesselSummary"
+                required: [operator_id, vessels]
+
+  /api/v1/public/booking-requests:
+    post:
+      tags: [Bookings]
+      security: []
+      summary: Public booking request intake (creates pending dive_booking; auto-creates guest diver if needed)
+      x-rate-limit:
+        limit: 10
+        window_seconds: 60
+        scope: ip
+        note: Recommended: 10 requests/minute/IP. Enforce in middleware.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublicBookingIntakeRequest"
+      responses:
+        "201":
+          description: Created pending booking
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingSummary"
+        "400":
+          description: Validation error (e.g., session_id not found, operator/session mismatch)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: Too Many Requests
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/notifications:
+    post:
+      tags: [Notifications]
+      summary: Create a notification in the send queue (internal)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NotificationCreateRequest"
+      responses:
+        "201":
+          description: Created notification
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notification_id:
+                    type: integer
+                  status:
+                    type: string
+                    example: pending
+                required: [notification_id, status]
