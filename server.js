@@ -1,7 +1,7 @@
 /*
     * AQUORIX Pro Backend Server
     * Description: Express server for AQUORIX Pro Dashboard, providing health check and Supabase PostgreSQL connectivity
-    * Version: 1.0.5
+    * Version: 1.0.7
     * Author: Larrym
     * Date: 2025-07-03
     * Change Log:
@@ -13,20 +13,43 @@
     *   - 2025-07-03: Added POST /api/sensors endpoint for CRUD operations (v1.0.3)
     *   - 2025-07-03: Added GET /api/alerts endpoint for CRUD operations (v1.0.4)
     *   - 2025-07-03: Added error handling to /api/health endpoint (v1.0.5)
+    *   - 2025-12-18: Added cont lines for swagger + yamljs (v1.0.6)
+    *   - 2025-12-18: Fixed Swagger UI setup order and added /docs endpoint (v1.0.7)
     */
 
+   require('dotenv').config(); // dotenv: Loads .env variables, like PHP's getenv()
+   
    const express = require('express'); // Express: Like PHP's Laravel for routing HTTP requests
    const cors = require('cors'); // CORS: Allows frontend (localhost:3004) to talk to backend
    const { Pool } = require('pg'); // pg: PostgreSQL client, like PHP's mysqli for MySQL
-   require('dotenv').config(); // dotenv: Loads .env variables, like PHP's getenv()
+   const path = require("path"); // Added 12-18-2025 -- Swagger / yamljs
+   const swaggerUi = require("swagger-ui-express");
+   const YAML = require("yamljs");
 
    const app = express();
    const port = process.env.PORT || 3001; // Port: Uses env variable or defaults to 3001
 
+   app.use(express.json()); // Parse JSON requests, like PHP's json_decode
+
+   // Swagger UI (Scheduler M1 Contract - 2025-12-18 - v1.0.6)
+   try {
+    const openApiPath = path.join(__dirname, "openapi-scheduler-m1.yaml");
+    const openApiSpec = YAML.load(openApiPath);
+    app.use("/docs", swaggerUi.serve, swaggerUi.setup(openApiSpec, {
+      customSiteTitle: "AQUORIX Scheduler API",
+      customCss: ".swagger-ui .topbar { display: none }"
+    }));
+    console.log("Swagger docs wired at /docs");
+  } catch (err) {
+    console.error("Swagger spec load failed:", err.message);
+  }
+
    // Database connection pool: Connects to Supabase PostgreSQL, like PHP's PDO
+   const useSsl = (process.env.DB_SSL || "true").toLowerCase() !== "false";
+
    const pool = new Pool({
-     connectionString: process.env.DATABASE_URL, // Supabase transaction pooler, e.g., postgresql://postgres.spltrqrscqmtrfknvycj:3xpl0r3th3D3pths2025@aws-0-us-west-1.pooler.supabase.com:6543/postgres
-     ssl: { rejectUnauthorized: false } // Required for Supabase, like PHP's SSL options
+     connectionString: process.env.DATABASE_URL,
+     ssl: useSsl ? { rejectUnauthorized: false } : false
    });
 
    // Test database connection on startup, like PHP's mysqli_connect test
@@ -40,7 +63,6 @@
    });
 
    app.use(cors({ origin: 'http://localhost:3004' })); // Allow frontend requests
-   app.use(express.json()); // Parse JSON requests, like PHP's json_decode
 
    // Health check endpoint, like a PHP endpoint returning JSON
    app.get('/api/health', async (req, res) => {
@@ -115,4 +137,5 @@ app.get('/api/sensors', async (req, res) => {
 
    app.listen(port, () => {
      console.log(`AQUORIX Pro Backend running at http://localhost:${port}`); // Start server, like PHP's built-in server
+     console.log(`API Documentation: http://localhost:${port}/docs`);
    });
