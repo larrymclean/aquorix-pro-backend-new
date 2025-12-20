@@ -25,6 +25,7 @@
    const path = require("path"); // Added 12-18-2025 -- Swagger / yamljs
    const swaggerUi = require("swagger-ui-express");
    const YAML = require("yamljs");
+   const schedulerRouter = require("./src/routes/scheduler");
 
    const app = express();
    const port = process.env.PORT || 3001; // Port: Uses env variable or defaults to 3001
@@ -44,23 +45,31 @@
     console.error("Swagger spec load failed:", err.message);
   }
 
-   // Database connection pool: Connects to Supabase PostgreSQL, like PHP's PDO
+   // Database connection pool: Connects to AQUORIX PostgreSQL (db: aquorix, schema: aquorix)
    const useSsl = (process.env.DB_SSL || "true").toLowerCase() !== "false";
 
    const pool = new Pool({
-     connectionString: process.env.DATABASE_URL,
-     ssl: useSsl ? { rejectUnauthorized: false } : false
-   });
+    connectionString: process.env.DATABASE_URL,
+    ssl: useSsl ? { rejectUnauthorized: false } : false,
+    options: "-c search_path=aquorix,public",
+  });
 
    // Test database connection on startup, like PHP's mysqli_connect test
    pool.connect((err, client, release) => {
      if (err) {
-       console.error('Error connecting to Supabase database:', err.stack); // Log errors, like PHP's error_log
+       console.error('Error connecting to AQUORIX Postgres (aquorix):', err.stack); // Log errors, like PHP's error_log
        return;
      }
-     console.log('Connected to Supabase PostgreSQL database');
+     console.log('Connected to AQUORIX Postgres (aquorix)');
      release(); // Release client back to pool, like closing a PHP DB connection
    });
+
+   // Make DB pool available to routers
+    app.locals.pool = pool;
+
+    // Scheduler routes (M1)
+    app.use("/api/v1", schedulerRouter);
+    console.log("Scheduler routes mounted at /api/v1");
 
    app.use(cors({ origin: 'http://localhost:3004' })); // Allow frontend requests
 
@@ -76,6 +85,22 @@
        res.status(500).json({ status: 'unhealthy', dbConnected: false, error: err.message });
      }
    });
+
+   app.get('/api/dbinfo', async (req, res) => {
+    try {
+      const client = await pool.connect();
+      const r = await client.query(`
+        SELECT current_database() AS db,
+              current_user AS usr,
+              current_schema() AS schema
+      `);
+      client.release();
+      res.json(r.rows[0]);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
 
    // Get all users, like a PHP script with SELECT query
    app.get('/api/users', async (req, res) => {
