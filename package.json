@@ -2,11 +2,12 @@
   "name": "aquorix-pro-backend-new",
   "version": "1.0.0",
   "description": "",
-  "main": "dist/server.js",
+  "main": "server.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/server.js",
-    "test": "jest"
+    "start": "node server.js",
+    "test": "jest",
+    "dev": "node server.js"
   },
   "keywords": [],
   "author": "",
@@ -19,7 +20,9 @@
     "dotenv": "^16.6.1",
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.2",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "swagger-ui-express": "^5.0.1",
+    "yamljs": "^0.3.0"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",

@@ -1,36 +1,66 @@
 /*
-    * AQUORIX Pro Backend Server
-    * Description: Express server for AQUORIX Pro Dashboard, providing health check and Supabase PostgreSQL connectivity
-    * Version: 1.0.7
-    * Author: Larrym
-    * Date: 2025-07-03
-    * Change Log:
-    *   - 2025-07-01: Initial setup with /api/health endpoint (v1.0.0)
-    *   - 2025-07-01: Added CORS middleware for http://localhost:3004
-    *   - 2025-07-01: Added .gitignore to exclude node_modules
-    *   - 2025-07-02: Added Supabase PostgreSQL connection pool with transaction mode (v1.0.1)
-    *   - 2025-07-03: Added GET /api/users endpoint for CRUD operations (v1.0.2)
-    *   - 2025-07-03: Added POST /api/sensors endpoint for CRUD operations (v1.0.3)
-    *   - 2025-07-03: Added GET /api/alerts endpoint for CRUD operations (v1.0.4)
-    *   - 2025-07-03: Added error handling to /api/health endpoint (v1.0.5)
-    *   - 2025-12-18: Added cont lines for swagger + yamljs (v1.0.6)
-    *   - 2025-12-18: Fixed Swagger UI setup order and added /docs endpoint (v1.0.7)
-    */
+ * AQUORIX Pro Backend Server
+ * Description: Express server for AQUORIX Pro Dashboard, providing health check and Supabase PostgreSQL connectivity
+ * Version: 1.0.7
+ * Author: Larrym
+ * Date: 2025-07-03
+ * Change Log:
+ *   - 2025-07-01: Initial setup with /api/health endpoint (v1.0.0)
+ *   - 2025-07-01: Added CORS middleware for http://localhost:3004
+ *   - 2025-07-01: Added .gitignore to exclude node_modules
+ *   - 2025-07-02: Added Supabase PostgreSQL connection pool with transaction mode (v1.0.1)
+ *   - 2025-07-03: Added GET /api/users endpoint for CRUD operations (v1.0.2)
+ *   - 2025-07-03: Added POST /api/sensors endpoint for CRUD operations (v1.0.3)
+ *   - 2025-07-03: Added GET /api/alerts endpoint for CRUD operations (v1.0.4)
+ *   - 2025-07-03: Added error handling to /api/health endpoint (v1.0.5)
+ *   - 2025-12-18: Added cont lines for swagger + yamljs (v1.0.6)
+ *   - 2025-12-18: Fixed Swagger UI setup order and added /docs endpoint (v1.0.7)
+ */
 
-   require('dotenv').config(); // dotenv: Loads .env variables, like PHP's getenv()
-   
-   const express = require('express'); // Express: Like PHP's Laravel for routing HTTP requests
-   const cors = require('cors'); // CORS: Allows frontend (localhost:3004) to talk to backend
-   const { Pool } = require('pg'); // pg: PostgreSQL client, like PHP's mysqli for MySQL
-   const path = require("path"); // Added 12-18-2025 -- Swagger / yamljs
-   const swaggerUi = require("swagger-ui-express");
-   const YAML = require("yamljs");
-   const schedulerRouter = require("./src/routes/scheduler");
+  require('dotenv').config();
 
-   const app = express();
-   const port = process.env.PORT || 3001; // Port: Uses env variable or defaults to 3001
+  const express = require('express');
+  const cors = require('cors');
+  const { Pool } = require('pg');
+  const path = require('path');
+  const swaggerUi = require('swagger-ui-express');
+  const YAML = require('yamljs');
+  const schedulerRouter = require('./src/routes/scheduler');
 
-   app.use(express.json()); // Parse JSON requests, like PHP's json_decode
+  const app = express();
+  const port = process.env.PORT || 3001;
+
+  app.use(express.json());
+
+  /**
+   * ----------------------------------------------------------------------------
+   * CORS (Phase A)
+   * ----------------------------------------------------------------------------
+   * Purpose:
+   *  - Allow local Pro Dashboard dev server to call scheduler endpoints
+   * Notes:
+   *  - Tight whitelist: only local dashboard dev origins
+   *  - Expand later for widget/public gateway in Phase C
+   * ----------------------------------------------------------------------------
+   */
+  const ALLOWED_ORIGINS = [
+    'http://localhost:3500',
+    'http://127.0.0.1:3500'
+  ];
+
+  app.use(cors({
+    origin: function (origin, callback) {
+      // Allow non-browser tools (curl, Postman) with no Origin header
+      if (!origin) return callback(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+      return callback(new Error('CORS blocked: ' + origin));
+    },
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: false
+  }));
+
+  app.options('*', cors());
 
    // Swagger UI (Scheduler M1 Contract - 2025-12-18 - v1.0.6)
    try {
@@ -70,8 +100,6 @@
     // Scheduler routes (M1)
     app.use("/api/v1", schedulerRouter);
     console.log("Scheduler routes mounted at /api/v1");
-
-   app.use(cors({ origin: 'http://localhost:3004' })); // Allow frontend requests
 
    // Health check endpoint, like a PHP endpoint returning JSON
    app.get('/api/health', async (req, res) => {
