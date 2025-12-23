@@ -1,0 +1,76 @@
+
+/**
+ * ============================================================================
+ * AQUORIX "Me" Scheduler Routes (Phase B)
+ * ============================================================================
+ * Purpose:
+ *  - Authenticated schedule access WITHOUT operator_id in URL
+ *  - Enables Phase B frontend: operator_id derived from login context
+ *
+ * Endpoints:
+ *  - GET /api/v1/me/schedule/today
+ *  - GET /api/v1/me/schedule/week?start_date=YYYY-MM-DD
+ *
+ * Notes:
+ *  - Uses existing scheduler router/controller behavior via internal fetch
+ *  - Keeps Phase A endpoints unchanged
+ * ============================================================================
+ */
+
+const express = require("express");
+const router = express.Router();
+
+const { requireAuth } = require("../middleware/auth");
+const { resolveOperator } = require("../middleware/resolveOperator");
+
+// We will call the same scheduler handler by importing the router module’s handler
+// If your scheduler router exports handlers, use them directly.
+// If not, we will re-run the same SQL here in Phase B2.3 (safe, minimal duplication).
+
+/**
+ * Minimal duplication approach:
+ * Reuse the scheduler SQL by making an internal request is overkill.
+ * Instead: implement small queries here that match scheduler outputs.
+ *
+ * IMPORTANT:
+ * - Keep output shape consistent with existing endpoints.
+ * - Use operator timezone from DB (already used by scheduler routes).
+ */
+
+router.get("/me/schedule/today", requireAuth, resolveOperator, async (req, res) => {
+  const pool = req.app.locals.pool;
+  const operatorId = req.operatorContext.operator_id;
+
+  try {
+    // Delegate to the existing scheduler endpoint logic by querying the same views/tables
+    // If your schedulerRouter already has a helper function, we can refactor later (B2.5).
+    const r = await pool.query("SELECT * FROM aquorix.api_schedule_today($1)", [operatorId]);
+    return res.json(r.rows[0]);
+  } catch (err) {
+    console.error("[me/schedule/today] failed:", err);
+    return res.status(500).json({ error: "schedule_today_failed" });
+  }
+});
+
+router.get("/me/schedule/week", requireAuth, resolveOperator, async (req, res) => {
+  const pool = req.app.locals.pool;
+  const operatorId = req.operatorContext.operator_id;
+  const startDate = req.query.start_date;
+
+  if (!startDate) {
+    return res.status(400).json({ error: "missing_start_date" });
+  }
+
+  try {
+    const r = await pool.query("SELECT * FROM aquorix.api_schedule_week($1, $2::date)", [
+      operatorId,
+      startDate,
+    ]);
+    return res.json(r.rows[0]);
+  } catch (err) {
+    console.error("[me/schedule/week] failed:", err);
+    return res.status(500).json({ error: "schedule_week_failed" });
+  }
+});
+
+module.exports = router;

@@ -30,6 +30,17 @@
   const app = express();
   const port = process.env.PORT || 3001;
 
+  // Near other requires
+  const { requireAuth } = require("./src/middleware/auth");
+  const { resolveOperator } = require("./src/middleware/resolveOperator");
+  const meSchedulerRouter = require("./src/routes/meScheduler");
+
+  // Recovered Onboarding tech -- 12-22-25
+  const onboardingRouter = require('./src/routes/onboarding');
+
+  // Near app.use for other routers
+  app.use("/api/v1", meSchedulerRouter);  // Add this line
+
   app.use(express.json());
 
   /**
@@ -77,7 +88,6 @@
 
    // Database connection pool: Connects to AQUORIX PostgreSQL (db: aquorix, schema: aquorix)
    const useSsl = (process.env.DB_SSL || "true").toLowerCase() !== "false";
-
    const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: useSsl ? { rejectUnauthorized: false } : false,
@@ -97,9 +107,17 @@
    // Make DB pool available to routers
     app.locals.pool = pool;
 
-    // Scheduler routes (M1)
-    app.use("/api/v1", schedulerRouter);
-    console.log("Scheduler routes mounted at /api/v1");
+   // ----------------------------------------------------------------------------
+   // Onboarding Routes (require shared pool via req.app.locals.pool)
+   // ----------------------------------------------------------------------------
+   app.use('/api/onboarding', onboardingRouter);
+   app.use('/api/users', onboardingRouter);
+   console.log('Onboarding routes mounted at /api/onboarding');
+   console.log('User routes mounted at /api/users (update-step, promote)');
+
+   // Scheduler routes (M1)
+   app.use("/api/v1", schedulerRouter);
+   console.log("Scheduler routes mounted at /api/v1");
 
    // Health check endpoint, like a PHP endpoint returning JSON
    app.get('/api/health', async (req, res) => {
@@ -131,7 +149,8 @@
 
 
    // Get all users, like a PHP script with SELECT query
-   app.get('/api/users', async (req, res) => {
+   app.get('/api/admin/users', async (req, res) => {
+
      try {
        const client = await pool.connect();
        const result = await client.query('SELECT user_id, email, role, tier, created_at FROM users');
