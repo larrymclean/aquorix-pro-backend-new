@@ -66,4 +66,4 @@ async function resolveOperator(req, res, next) {
   }
 }
 
-module.exports = { resolveOperator };
+module.exports = resolveOperator;

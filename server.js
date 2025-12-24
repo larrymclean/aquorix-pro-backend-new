@@ -31,9 +31,12 @@
   const port = process.env.PORT || 3001;
 
   // Near other requires
-  const { requireAuth } = require("./src/middleware/auth");
-  const { resolveOperator } = require("./src/middleware/resolveOperator");
+  const requireAuth = require("./src/middleware/auth");
+  const resolveOperator = require("./src/middleware/resolveOperator");
+
   const meSchedulerRouter = require("./src/routes/meScheduler");
+
+  const me = require('./src/routes/me');
 
   // Recovered Onboarding tech -- 12-22-25
   const onboardingRouter = require('./src/routes/onboarding');
@@ -107,17 +110,23 @@
    // Make DB pool available to routers
     app.locals.pool = pool;
 
+    const usersRouter = require('./src/routes/users');
+    app.use('/api/users', usersRouter);
+    app.use('/api/users', onboardingRouter);
+
+    console.log('Users routes mounted at /api/users (by-supabase-id)');
+
    // ----------------------------------------------------------------------------
    // Onboarding Routes (require shared pool via req.app.locals.pool)
    // ----------------------------------------------------------------------------
    app.use('/api/onboarding', onboardingRouter);
-   app.use('/api/users', onboardingRouter);
    console.log('Onboarding routes mounted at /api/onboarding');
-   console.log('User routes mounted at /api/users (update-step, promote)');
 
    // Scheduler routes (M1)
    app.use("/api/v1", schedulerRouter);
    console.log("Scheduler routes mounted at /api/v1");
+
+   app.use('/api/v1/me', me);
 
    // Health check endpoint, like a PHP endpoint returning JSON
    app.get('/api/health', async (req, res) => {
