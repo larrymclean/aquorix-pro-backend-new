@@ -110,7 +110,7 @@
    // Make DB pool available to routers
     app.locals.pool = pool;
 
-    const usersRouter = require('./src/routes/users');
+    //const usersRouter = require('./src/routes/users');
     app.use('/api/users', usersRouter);
     app.use('/api/users', onboardingRouter);
 
