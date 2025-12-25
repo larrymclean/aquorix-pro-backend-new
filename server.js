@@ -110,9 +110,10 @@
    // Make DB pool available to routers
     app.locals.pool = pool;
 
+    // Comment out = kill legacy surface area
     //const usersRouter = require('./src/routes/users');
-    app.use('/api/users', usersRouter);
-    app.use('/api/users', onboardingRouter);
+    //app.use('/api/users', usersRouter);
+    //app.use('/api/users', onboardingRouter);
 
     console.log('Users routes mounted at /api/users (by-supabase-id)');
 
