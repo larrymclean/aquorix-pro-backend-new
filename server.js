@@ -1,223 +1,178 @@
 /*
  * AQUORIX Pro Backend Server
- * Description: Express server for AQUORIX Pro Dashboard, providing health check and Supabase PostgreSQL connectivity
- * Version: 1.0.7
+ * Description: Express server for AQUORIX Pro Dashboard (local dev + API)
+ * Version: 1.0.8
  * Author: Larrym
- * Date: 2025-07-03
+ * Date: 2025-12-27
+ *
  * Change Log:
- *   - 2025-07-01: Initial setup with /api/health endpoint (v1.0.0)
- *   - 2025-07-01: Added CORS middleware for http://localhost:3004
- *   - 2025-07-01: Added .gitignore to exclude node_modules
- *   - 2025-07-02: Added Supabase PostgreSQL connection pool with transaction mode (v1.0.1)
- *   - 2025-07-03: Added GET /api/users endpoint for CRUD operations (v1.0.2)
- *   - 2025-07-03: Added POST /api/sensors endpoint for CRUD operations (v1.0.3)
- *   - 2025-07-03: Added GET /api/alerts endpoint for CRUD operations (v1.0.4)
- *   - 2025-07-03: Added error handling to /api/health endpoint (v1.0.5)
- *   - 2025-12-18: Added cont lines for swagger + yamljs (v1.0.6)
- *   - 2025-12-18: Fixed Swagger UI setup order and added /docs endpoint (v1.0.7)
+ *   - 2025-12-27 (ChatGPT Lead): DIR fix — single CORS middleware, correct init order
+ *     - Fix "Cannot access 'app' before initialization"
+ *     - Remove duplicate CORS blocks (single source of truth)
+ *     - Allow Swagger UI origin (http://localhost:3001) to prevent self-blocking
  */
 
-  require('dotenv').config();
+require("dotenv").config();
 
-  const express = require('express');
-  const cors = require('cors');
-  const { Pool } = require('pg');
-  const path = require('path');
-  const swaggerUi = require('swagger-ui-express');
-  const YAML = require('yamljs');
-  const schedulerRouter = require('./src/routes/scheduler');
+const express = require("express");
+const cors = require("cors");
+const { Pool } = require("pg");
+const path = require("path");
+const swaggerUi = require("swagger-ui-express");
+const YAML = require("yamljs");
 
-  const app = express();
-  const port = process.env.PORT || 3001;
+const schedulerRouter = require("./src/routes/scheduler");
+const meSchedulerRouter = require("./src/routes/meScheduler");
+const me = require("./src/routes/me");
+const onboardingRouter = require("./src/routes/onboarding");
 
-  // Near other requires
-  const requireAuth = require("./src/middleware/auth");
-  const resolveOperator = require("./src/middleware/resolveOperator");
+// ----------------------------------------------------------------------------
+// App + Port
+// ----------------------------------------------------------------------------
+const app = express();
+const port = process.env.PORT || 3001;
 
-  const meSchedulerRouter = require("./src/routes/meScheduler");
+// ----------------------------------------------------------------------------
+// CORS (SINGLE SOURCE OF TRUTH - DIR)
+// ----------------------------------------------------------------------------
+// Why include 3001?
+// - Swagger UI is served from http://localhost:3001/docs
+// - Browser requests from /docs can include Origin: http://localhost:3001
+// - If we don't allow it, the server blocks itself.
+const ALLOWED_ORIGINS = new Set([
+  "http://localhost:3500",
+  "http://127.0.0.1:3500",
+  "http://localhost:3001",
+  "http://127.0.0.1:3001",
+  // Optional: if you ever run frontend on 3000
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  // add production origins later:
+  // "https://app.aquorix.pro",
+  // "https://aquorix.pro",
+]);
 
-  const me = require('./src/routes/me');
-
-  // Recovered Onboarding tech -- 12-22-25
-  const onboardingRouter = require('./src/routes/onboarding');
-
-  // Near app.use for other routers
-  app.use("/api/v1", meSchedulerRouter);  // Add this line
-
-  app.use(express.json());
-
-  /**
-   * ----------------------------------------------------------------------------
-   * CORS (Phase A)
-   * ----------------------------------------------------------------------------
-   * Purpose:
-   *  - Allow local Pro Dashboard dev server to call scheduler endpoints
-   * Notes:
-   *  - Tight whitelist: only local dashboard dev origins
-   *  - Expand later for widget/public gateway in Phase C
-   * ----------------------------------------------------------------------------
-   */
-  const ALLOWED_ORIGINS = [
-    'http://localhost:3500',
-    'http://127.0.0.1:3500'
-  ];
-
-  app.use(cors({
+app.use(
+  cors({
     origin: function (origin, callback) {
-      // Allow non-browser tools (curl, Postman) with no Origin header
+      // Allow server-to-server / curl / Postman (no Origin header)
       if (!origin) return callback(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-      return callback(new Error('CORS blocked: ' + origin));
+
+      if (ALLOWED_ORIGINS.has(origin)) return callback(null, true);
+
+      return callback(new Error(`CORS blocked: ${origin}`));
     },
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: false
-  }));
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 
-  app.options('*', cors());
+// Ensure preflight works across all routes
+app.options("*", cors());
 
-   // Swagger UI (Scheduler M1 Contract - 2025-12-18 - v1.0.6)
-   try {
-    const openApiPath = path.join(__dirname, "openapi-scheduler-m1.yaml");
-    const openApiSpec = YAML.load(openApiPath);
-    app.use("/docs", swaggerUi.serve, swaggerUi.setup(openApiSpec, {
+// ----------------------------------------------------------------------------
+// Body parsing
+// ----------------------------------------------------------------------------
+app.use(express.json());
+
+// ----------------------------------------------------------------------------
+// Swagger UI (Scheduler M1 Contract)
+// ----------------------------------------------------------------------------
+try {
+  const openApiPath = path.join(__dirname, "openapi-scheduler-m1.yaml");
+  const openApiSpec = YAML.load(openApiPath);
+
+  app.use(
+    "/docs",
+    swaggerUi.serve,
+    swaggerUi.setup(openApiSpec, {
       customSiteTitle: "AQUORIX Scheduler API",
-      customCss: ".swagger-ui .topbar { display: none }"
-    }));
-    console.log("Swagger docs wired at /docs");
-  } catch (err) {
-    console.error("Swagger spec load failed:", err.message);
+      customCss: ".swagger-ui .topbar { display: none }",
+    })
+  );
+
+  console.log("Swagger docs wired at /docs");
+} catch (err) {
+  console.error("Swagger spec load failed:", err.message);
+}
+
+// ----------------------------------------------------------------------------
+// Database connection pool
+// ----------------------------------------------------------------------------
+const useSsl = (process.env.DB_SSL || "true").toLowerCase() !== "false";
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: useSsl ? { rejectUnauthorized: false } : false,
+  options: "-c search_path=aquorix,public",
+});
+
+// Test DB connection on startup
+pool.connect((err, client, release) => {
+  if (err) {
+    console.error("Error connecting to AQUORIX Postgres (aquorix):", err.stack);
+    return;
   }
+  console.log("Connected to AQUORIX Postgres (aquorix)");
+  release();
+});
 
-   // Database connection pool: Connects to AQUORIX PostgreSQL (db: aquorix, schema: aquorix)
-   const useSsl = (process.env.DB_SSL || "true").toLowerCase() !== "false";
-   const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: useSsl ? { rejectUnauthorized: false } : false,
-    options: "-c search_path=aquorix,public",
-  });
+// Make pool available to routers
+app.locals.pool = pool;
 
-   // Test database connection on startup, like PHP's mysqli_connect test
-   pool.connect((err, client, release) => {
-     if (err) {
-       console.error('Error connecting to AQUORIX Postgres (aquorix):', err.stack); // Log errors, like PHP's error_log
-       return;
-     }
-     console.log('Connected to AQUORIX Postgres (aquorix)');
-     release(); // Release client back to pool, like closing a PHP DB connection
-   });
+// ----------------------------------------------------------------------------
+// Routes
+// ----------------------------------------------------------------------------
 
-   // Make DB pool available to routers
-    app.locals.pool = pool;
+// Scheduler routes (M1)
+app.use("/api/v1", schedulerRouter);
+console.log("Scheduler routes mounted at /api/v1");
 
-    // Comment out = kill legacy surface area
-    //const usersRouter = require('./src/routes/users');
-    //app.use('/api/users', usersRouter);
-    //app.use('/api/users', onboardingRouter);
+// Me scheduler router (if this is a router that expects /api/v1 base)
+app.use("/api/v1", meSchedulerRouter);
+console.log("MeScheduler routes mounted at /api/v1");
 
-    console.log('Users routes mounted at /api/users (by-supabase-id)');
+// Me route
+app.use("/api/v1/me", me);
 
-   // ----------------------------------------------------------------------------
-   // Onboarding Routes (require shared pool via req.app.locals.pool)
-   // ----------------------------------------------------------------------------
-   app.use('/api/onboarding', onboardingRouter);
-   console.log('Onboarding routes mounted at /api/onboarding');
+// Onboarding
+app.use("/api/onboarding", onboardingRouter);
+console.log("Onboarding routes mounted at /api/onboarding");
 
-   // Scheduler routes (M1)
-   app.use("/api/v1", schedulerRouter);
-   console.log("Scheduler routes mounted at /api/v1");
-
-   app.use('/api/v1/me', me);
-
-   // Health check endpoint, like a PHP endpoint returning JSON
-   app.get('/api/health', async (req, res) => {
-     try {
-       const client = await pool.connect();
-       await client.query('SELECT 1'); // Simple query to test DB connection
-       client.release();
-       res.json({ status: 'healthy', dbConnected: true });
-     } catch (err) {
-       console.error('Health check failed:', err.stack);
-       res.status(500).json({ status: 'unhealthy', dbConnected: false, error: err.message });
-     }
-   });
-
-   app.get('/api/dbinfo', async (req, res) => {
-    try {
-      const client = await pool.connect();
-      const r = await client.query(`
-        SELECT current_database() AS db,
-              current_user AS usr,
-              current_schema() AS schema
-      `);
-      client.release();
-      res.json(r.rows[0]);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-
-   // Get all users, like a PHP script with SELECT query
-   app.get('/api/admin/users', async (req, res) => {
-
-     try {
-       const client = await pool.connect();
-       const result = await client.query('SELECT user_id, email, role, tier, created_at FROM users');
-       client.release();
-       res.json(result.rows);
-     } catch (err) {
-       console.error('Error fetching users:', err.stack);
-       res.status(500).json({ error: 'Failed to fetch users' });
-     }
-   });
-
-   // Insert sensor data, like a PHP script with INSERT query
-   app.post('/api/sensors', async (req, res) => {
-     try {
-       const { dive_id, temperature, depth } = req.body;
-       if (!dive_id) {
-         return res.status(400).json({ error: 'dive_id is required' });
-       }
-       const client = await pool.connect();
-       const result = await client.query(
-         'INSERT INTO sensor_data (dive_id, temperature, depth) VALUES ($1, $2, $3) RETURNING *',
-         [dive_id, temperature, depth]
-       );
-       client.release();
-       res.json(result.rows[0]);
-     } catch (err) {
-       console.error('Error inserting sensor data:', err.stack);
-       res.status(500).json({ error: 'Failed to insert sensor data' });
-     }
-   });
-
-   // Get all alerts, like a PHP script with SELECT query
-   app.get('/api/alerts', async (req, res) => {
-     try {
-       const client = await pool.connect();
-       const result = await client.query('SELECT alert_id, user_id, message, severity, timestamp FROM alerts');
-       client.release();
-       res.json(result.rows);
-     } catch (err) {
-       console.error('Error fetching alerts:', err.stack);
-       res.status(500).json({ error: 'Failed to fetch alerts' });
-     }
-   });
-
-app.get('/api/sensors', async (req, res) => {
+// Health check
+app.get("/api/health", async (req, res) => {
   try {
     const client = await pool.connect();
-    const result = await client.query('SELECT sensor_id, dive_id, temperature, depth, timestamp FROM sensor_data');
+    await client.query("SELECT 1");
     client.release();
-    res.json(result.rows);
-    } catch (err) {
-      console.error('Error fetching sensor data:', err.stack);
-      res.status(500).json({ error: 'Failed to fetch sensor data' });
-    }
-  });
+    res.json({ status: "healthy", dbConnected: true });
+  } catch (err) {
+    console.error("Health check failed:", err.stack);
+    res.status(500).json({ status: "unhealthy", dbConnected: false, error: err.message });
+  }
+});
 
-   app.listen(port, () => {
-     console.log(`AQUORIX Pro Backend running at http://localhost:${port}`); // Start server, like PHP's built-in server
-     console.log(`API Documentation: http://localhost:${port}/docs`);
-   });
+// DB info
+app.get("/api/dbinfo", async (req, res) => {
+  try {
+    const client = await pool.connect();
+    const r = await client.query(`
+      SELECT current_database() AS db,
+             current_user AS usr,
+             current_schema() AS schema
+    `);
+    client.release();
+    res.json(r.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------------------------------------------------------
+// Start server
+// ----------------------------------------------------------------------------
+app.listen(port, () => {
+  console.log(`AQUORIX Pro Backend running at http://localhost:${port}`);
+  console.log(`API Documentation: http://localhost:${port}/docs`);
+});

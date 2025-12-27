@@ -19,8 +19,16 @@
 const express = require("express");
 const router = express.Router();
 
-const { requireAuth } = require("../middleware/auth");
-const { resolveOperator } = require("../middleware/resolveOperator");
+const requireAuth = require("../middleware/auth");
+const resolveOperator = require("../middleware/resolveOperator");
+
+// Error checking while stabilizing
+if (typeof requireAuth !== "function") {
+  throw new Error("Middleware load error: requireAuth is not a function");
+}
+if (typeof resolveOperator !== "function") {
+  throw new Error("Middleware load error: resolveOperator is not a function");
+}
 
 /**
  * Copied from scheduler.js (keep in sync; Phase B uses inline to avoid drift)

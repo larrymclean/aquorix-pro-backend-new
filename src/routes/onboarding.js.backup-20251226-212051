@@ -2,24 +2,18 @@
 // Description: AQUORIX Onboarding API routes for user onboarding steps (Step 1, ...)
 // Author: Cascade AI (with Larry McLean)
 // Created: 2025-09-17
-// Last Updated: 2025-12-27
-// Status: Phase B+ — update-step strict sealing + tier_level persistence
+// Last Updated: 2025-09-17
+// Status: In Progress
 // Dependencies: express, pg (Pool)
 // Notes: Implements POST /api/onboarding/step1 for onboarding Step 1 identity persistence.
 // Change Log:
 //   - 2025-09-17 (Cascade): Initial implementation of onboarding step 1 endpoint, transaction-safe upsert into users and pro_profiles.
-//   - 2025-12-27 (Larry + ChatGPT Lead): Phase B+ Gate 2 strict seal + optional tier_level persistence (canonical pro_profiles.tier_level)
 
 const express = require('express');
 const router = express.Router();
 
 // POST /api/onboarding/step1
 router.post('/step1', async (req, res) => {
-  
-  // LSM Debug 12-27-2025
-  console.log("[step1] origin:", req.headers.origin);
-  console.log("[step1] body:", req.body);
-
   const { supabase_user_id, first_name, last_name, phone, email } = req.body;
 
   const pool = req.app.locals.pool;
@@ -119,7 +113,7 @@ router.get('/step1/:supabase_user_id', async (req, res) => {
 });
 
 /**
- * POST /api/onboarding/update-step
+ * POST /api/users/update-step
  * Update onboarding progress in pro_profiles.onboarding_metadata
  */
 router.post("/update-step", async (req, res) => {
@@ -129,9 +123,7 @@ router.post("/update-step", async (req, res) => {
     supabase_user_id,
     current_step,
     completed_steps,
-    completion_percentage,
-    tier_level,
-    selected_tier
+    completion_percentage
   } = req.body;
 
   if (!supabase_user_id || typeof current_step !== "number") {
@@ -153,34 +145,6 @@ router.post("/update-step", async (req, res) => {
     }
 
     const userId = u.rows[0].user_id;
-
-    // ------------------------------
-    // OPTIONAL: Persist tier_level (DB is King)
-    // Canonical truth: pro_profiles.tier_level (1..5)
-    // ------------------------------
-    if (tier_level !== undefined && tier_level !== null) {
-      const parsedTier = Number(tier_level);
-
-      // Enforce DB constraint 1..5 (do NOT allow 0)
-      if (![1, 2, 3, 4, 5].includes(parsedTier)) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          success: false,
-          error: `Invalid tier_level '${tier_level}'. Must be 1..5.`,
-          hint: "Admin is role-based, not tier_level.",
-        });
-      }
-
-      await client.query(
-        `
-        UPDATE aquorix.pro_profiles
-        SET tier_level = $1,
-            updated_at = NOW()
-        WHERE user_id = $2
-        `,
-        [parsedTier, userId]
-      );
-    }
 
     const completed = Array.isArray(completed_steps) ? completed_steps : [];
     const pct = typeof completion_percentage === "number" ? completion_percentage : 0;
@@ -204,155 +168,8 @@ router.post("/update-step", async (req, res) => {
       [userId, current_step, completed, pct]
     );
 
-    // ---------------------------
-    // Phase B+ Gate 2: Completion Sealing Trigger (STRICT)
-    // Seal only when truly complete:
-    // - step 4 reached AND
-    // - completion_percentage >= 100
-    // ---------------------------
-    const reachedStep4 =
-      current_step >= 4 || (Array.isArray(completed) && completed.includes(4));
-    const reachedPct = pct >= 100;
-    const shouldSeal = reachedStep4 && reachedPct;
-
-    let sealed = false;
-
-    if (shouldSeal) {
-      // 1) Read tier truth from DB (authoritative)
-      const tierR = await client.query(
-        `
-        SELECT tier_level
-        FROM aquorix.pro_profiles
-        WHERE user_id = $1
-        LIMIT 1
-        `,
-        [userId]
-      );
-
-      const tier_level = tierR.rows[0]?.tier_level || null;
-      if (!tier_level) {
-        throw new Error("TIER_LEVEL_NOT_FOUND");
-      }
-
-      // 2) Tier-aware sealing (idempotent using WHERE NOT EXISTS; no constraint assumptions)
-
-      // Tier 1–2: Optional dive_leaders
-      if (tier_level === 1 || tier_level === 2) {
-        await client.query(
-          `
-          INSERT INTO aquorix.dive_leaders (user_id)
-          SELECT $1
-          WHERE NOT EXISTS (
-            SELECT 1 FROM aquorix.dive_leaders dl WHERE dl.user_id = $1
-          )
-          `,
-          [userId]
-        );
-      }
-
-      // Tier 3–4: Required operator + affiliation
-      if (tier_level === 3 || tier_level === 4) {
-        const existingAff = await client.query(
-          `
-          SELECT operator_id
-          FROM aquorix.user_operator_affiliations
-          WHERE user_id = $1 AND active = true
-          ORDER BY created_at DESC
-          LIMIT 1
-          `,
-          [userId]
-        );
-
-        if (existingAff.rowCount === 0) {
-          const profileR = await client.query(
-            `
-            SELECT business_name, first_name, last_name
-            FROM aquorix.pro_profiles
-            WHERE user_id = $1
-            LIMIT 1
-            `,
-            [userId]
-          );
-
-          const p = profileR.rows[0] || {};
-          const operatorName =
-            (p.business_name || "").trim() ||
-            `${(p.first_name || "Pro").trim()} ${(p.last_name || "Diver").trim()} Diving`;
-
-          const opR = await client.query(
-            `
-            INSERT INTO aquorix.diveoperators (name, created_by_user_id)
-            VALUES ($1, $2)
-            RETURNING operator_id
-            `,
-            [operatorName, userId]
-          );
-
-          const operator_id = opR.rows[0]?.operator_id;
-          if (!operator_id) {
-            throw new Error("OPERATOR_CREATE_FAILED");
-          }
-
-          // affiliation_type enum values are: staff, customer, freelance
-          // For Tier 3/4 operator owner-like link in Phase B+, we use 'staff'.
-          await client.query(
-            `
-            INSERT INTO aquorix.user_operator_affiliations
-              (user_id, operator_id, affiliation_type, active)
-            SELECT $1, $2, 'staff', true
-            WHERE NOT EXISTS (
-              SELECT 1
-              FROM aquorix.user_operator_affiliations uoa
-              WHERE uoa.user_id = $1
-                AND uoa.operator_id = $2
-                AND uoa.active = true
-            )
-            `,
-            [userId, operator_id]
-          );
-        }
-      }
-
-      // Tier 5: Required affiliate
-      if (tier_level === 5) {
-        await client.query(
-          `
-          INSERT INTO aquorix.affiliates (user_id)
-          SELECT $1
-          WHERE NOT EXISTS (
-            SELECT 1 FROM aquorix.affiliates a WHERE a.user_id = $1
-          )
-          `,
-          [userId]
-        );
-      }
-
-      // 3) Mark onboarding complete (canonical truth)
-      await client.query(
-        `
-        UPDATE aquorix.pro_profiles
-        SET onboarding_metadata =
-          jsonb_set(
-            jsonb_set(
-              jsonb_set(
-                COALESCE(onboarding_metadata, '{}'::jsonb),
-                '{is_complete}', to_jsonb(true), true
-              ),
-              '{completion_percentage}', to_jsonb(100), true
-            ),
-            '{last_activity}', to_jsonb(NOW()), true
-          )
-        WHERE user_id = $1
-        `,
-        [userId]
-      );
-
-      sealed = true;
-    }
-
     await client.query("COMMIT");
-    return res.json({ success: true, sealed });
-    
+    return res.json({ success: true });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("[update-step] error:", err);

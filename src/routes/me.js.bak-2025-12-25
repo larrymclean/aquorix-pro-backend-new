@@ -92,7 +92,6 @@ router.get("/", requireAuth, resolveOperator, async (req, res) => {
         u.supabase_user_id,
         u.email,
         u.tier,
-        u.role,
         u.created_at,
         p.first_name,
         p.last_name,
@@ -147,33 +146,35 @@ router.get("/", requireAuth, resolveOperator, async (req, res) => {
         const uuidSuffix2 = String(supabase_user_id).replace(/-/g, "").slice(0, 12);
         const u2 = `user_${uuidSuffix2}`.slice(0, 50);
 
-        const userUpsertQ =  `
+        const insertUserQ = `
           INSERT INTO aquorix.users (supabase_user_id, email, username, tier, role, created_at)
           VALUES ($1, $2, $3, 'solo', 'user', NOW())
-          ON CONFLICT (supabase_user_id)
-          DO UPDATE SET email = EXCLUDED.email
-          RETURNING user_id;
+          ON CONFLICT (supabase_user_id) DO NOTHING;
         `;
 
         // Attempt insert with u1; on username collision, retry u2.
         // NOTE: if email is already taken by some other record, Postgres will throw 23505 and we fail out (correct).
-        let user_id;
-
         try {
-          const up1 = await client.query(userUpsertQ, [supabase_user_id, email_from_jwt, u1]);
-          user_id = up1.rows[0]?.user_id;
+          await client.query(insertUserQ, [supabase_user_id, email_from_jwt, u1]);
         } catch (e) {
           if (e && e.code === "23505") {
-            const up2 = await client.query(userUpsertQ, [supabase_user_id, email_from_jwt, u2]);
-            user_id = up2.rows[0]?.user_id;
+            await client.query(insertUserQ, [supabase_user_id, email_from_jwt, u2]);
           } else {
             throw e;
           }
         }
 
-        if (!user_id) {
+        // Fetch user_id (now should exist due to insert or prior presence)
+        const uidR = await client.query(
+          `SELECT user_id FROM aquorix.users WHERE supabase_user_id = $1 LIMIT 1;`,
+          [supabase_user_id]
+        );
+
+        if (uidR.rows.length === 0) {
           throw new Error("SELF_HEAL_FAILED_NO_USER_ID");
         }
+
+        const user_id = uidR.rows[0].user_id;
 
         // Ensure pro_profiles exists (tier_level NOT NULL) + init onboarding_metadata
         const initOnboarding = {
@@ -186,8 +187,8 @@ router.get("/", requireAuth, resolveOperator, async (req, res) => {
 
         await client.query(
           `
-          INSERT INTO aquorix.pro_profiles (user_id, tier_level, onboarding_metadata)
-          VALUES ($1, $2, $3::jsonb)
+          INSERT INTO aquorix.pro_profiles (user_id, tier_level, onboarding_metadata, created_at, updated_at)
+          VALUES ($1, $2, $3::jsonb, NOW(), NOW())
           ON CONFLICT (user_id) DO NOTHING;
           `,
           [user_id, 1, JSON.stringify(initOnboarding)]
@@ -246,16 +247,12 @@ router.get("/", requireAuth, resolveOperator, async (req, res) => {
     const om = dbUser.onboarding_metadata || {};
     const current_step = om.current_step ?? null;
     const completed_steps = Array.isArray(om.completed_steps) ? om.completed_steps : [];
-    const completion_percentage =
-      typeof om.completion_percentage === "number" ? om.completion_percentage : null;
+    const completion_percentage = om.completion_percentage ?? null;
 
-    // STRICT completion rule (Phase B+):
-    // Dashboard ONLY when explicitly sealed.
-    // - completion_percentage === 100 OR om.is_complete === true
-    // Everything else is onboarding.
+    // Conservative completion check (match your existing 80% reality)
     const is_complete =
-      om.is_complete === true ||
-      completion_percentage === 100;
+      completed_steps.length >= 4 &&
+      (completion_percentage === null || completion_percentage >= 80);
 
     const routing_hint = is_complete ? "dashboard" : "onboarding";
 
@@ -277,7 +274,6 @@ router.get("/", requireAuth, resolveOperator, async (req, res) => {
       aquorix_user: {
         user_id: dbUser.user_id,
         tier: dbUser.tier || null,
-        role: dbUser.role || "user",
         created_at: dbUser.created_at || null,
         profile: {
           first_name: dbUser.first_name || null,
