@@ -5,22 +5,22 @@
  * File:        src/routes/me.js
  * Purpose:     Single source of truth for authenticated user identity, operator
  *              context, onboarding status, and permission flags (Phase C keystone).
- * Version:     v1.0.3
+ * Version:     v1.0.2
  * Created:     2025-12-23
- * Updated:     2025-12-29
+ * Updated:     2025-12-25
  * Author:      Larry McLean
  * Project:     AQUORIX™ API Project
  *
  * Description:
  * - Returns authenticated user context used for frontend routing and guards.
- * - Requires JWT auth (Supabase).
- * - DB-backed: canonical tier comes from aquorix.pro_profiles.tier_level (NOT users.tier).
- * - Operator context is chosen deterministically from active affiliations:
- *     primary operator = most recent active affiliation (created_at DESC).
+ * - Requires JWT auth (Supabase) and resolves operator context via affiliations.
+ * - DB-backed: pulls canonical user + onboarding_metadata from aquorix DB.
  *
  * Dependencies:
  * - middleware/auth.js (requireAuth)
+ * - middleware/resolveOperator.js (resolveOperator)
  * - req.auth (from requireAuth)
+ * - req.operatorContext (from resolveOperator)
  * - req.app.locals.pool (Postgres pool)
  *
  * Change Log:
@@ -35,11 +35,6 @@
  *   - Self-heal: create aquorix.users + aquorix.pro_profiles on first /me for new Supabase signups
  *   - Satisfy NOT NULL fields (email, username, tier_level) deterministically
  *   - Re-run canonical query to preserve response shape (no payload drift)
- * v1.0.3 - 2025-12-29 - Larry McLean
- *   - Canonical tier: derive from pro_profiles.tier_level (users.tier treated as legacy)
- *   - Deterministic operator selection: most recent active affiliation
- *   - Include operator.logo_url to support dashboard branding (Tier 2/3/4)
- *   - Permissions updated to match current affiliation enum (staff/customer/freelance)
  *
  * Notes:
  * - Do NOT alter existing changelog entries
@@ -52,31 +47,21 @@ const express = require("express");
 const router = express.Router();
 
 const requireAuth = require("../middleware/auth");
+const resolveOperator = require("../middleware/resolveOperator");
 
 // Fail fast if middleware wiring breaks (prevents silent drift)
 if (typeof requireAuth !== "function") {
   throw new Error("Middleware load error: requireAuth is not a function.");
 }
-
-/**
- * Map tier_level (1..5) to a stable label for the frontend.
- * IMPORTANT: tier routing truth is tier_level, not users.tier.
- */
-function tierLabelFromLevel(tier_level) {
-  const t = Number(tier_level);
-  if (t === 1) return "solo_pro";
-  if (t === 2) return "solo_pro_entrepreneur";
-  if (t === 3) return "dive_center";
-  if (t === 4) return "integrated_operator";
-  if (t === 5) return "affiliate";
-  return "unknown";
+if (typeof resolveOperator !== "function") {
+  throw new Error("Middleware load error: resolveOperator is not a function.");
 }
 
 /**
  * GET /api/v1/me
  * Requires: Authorization: Bearer <Supabase JWT>
  */
-router.get("/", requireAuth, async (req, res) => {
+router.get("/", requireAuth, resolveOperator, async (req, res) => {
   try {
     const pool = req.app?.locals?.pool;
     if (!pool) {
@@ -95,22 +80,23 @@ router.get("/", requireAuth, async (req, res) => {
       });
     }
 
+    // ✅ Read operator context from req.operatorContext (set by resolveOperator)
+    const operatorCtx = req.operatorContext || {};
+    const operator_id = operatorCtx.operator_id ?? null;
+    const affiliation = operatorCtx.affiliation_type ?? null;
+
     // Canonical user + profile (DB truth)
-    // NOTE: tier_level is canonical tier. users.tier is legacy / non-authoritative.
     const userQ = `
       SELECT
         u.user_id,
         u.supabase_user_id,
         u.email,
-        u.tier,          -- legacy (do not use for routing)
+        u.tier,
         u.role,
         u.created_at,
-        p.tier_level,    -- canonical tier (1..5)
         p.first_name,
         p.last_name,
         p.phone,
-        p.business_name,
-        p.logo_url AS pro_logo_url,
         p.onboarding_metadata
       FROM aquorix.users u
       LEFT JOIN aquorix.pro_profiles p ON p.user_id = u.user_id
@@ -122,11 +108,16 @@ router.get("/", requireAuth, async (req, res) => {
     let userR = await pool.query(userQ, [supabase_user_id]);
 
     // ------------------------------------------------------------------------
-    // Phase B Self-Heal: First /me call after Supabase signup
+    // Phase B Self-Heal (v1.0.2): First /me call after Supabase signup
     // Creates required aquorix.users + aquorix.pro_profiles rows (idempotent)
+    // Requirements based on schema:
+    // - aquorix.users.email NOT NULL
+    // - aquorix.users.username NOT NULL (UNIQUE)
+    // - aquorix.pro_profiles.tier_level NOT NULL (1..5)
     // ------------------------------------------------------------------------
     if (userR.rows.length === 0) {
       if (!email_from_jwt) {
+        // Cannot satisfy users.email NOT NULL without email. Fail fast.
         return res.status(400).json({
           ok: false,
           error: "AUTH_EMAIL_MISSING",
@@ -156,7 +147,7 @@ router.get("/", requireAuth, async (req, res) => {
         const uuidSuffix2 = String(supabase_user_id).replace(/-/g, "").slice(0, 12);
         const u2 = `user_${uuidSuffix2}`.slice(0, 50);
 
-        const userUpsertQ = `
+        const userUpsertQ =  `
           INSERT INTO aquorix.users (supabase_user_id, email, username, tier, role, created_at)
           VALUES ($1, $2, $3, 'solo', 'user', NOW())
           ON CONFLICT (supabase_user_id)
@@ -164,6 +155,8 @@ router.get("/", requireAuth, async (req, res) => {
           RETURNING user_id;
         `;
 
+        // Attempt insert with u1; on username collision, retry u2.
+        // NOTE: if email is already taken by some other record, Postgres will throw 23505 and we fail out (correct).
         let user_id;
 
         try {
@@ -183,11 +176,10 @@ router.get("/", requireAuth, async (req, res) => {
         }
 
         // Ensure pro_profiles exists (tier_level NOT NULL) + init onboarding_metadata
-        const nowIso = new Date().toISOString();
         const initOnboarding = {
-          started_at: nowIso,
+          started_at: new Date().toISOString(),
           current_step: 1,
-          last_activity: nowIso,
+          last_activity: new Date().toISOString(),
           completed_steps: [],
           completion_percentage: 0,
         };
@@ -237,41 +229,11 @@ router.get("/", requireAuth, async (req, res) => {
 
     const dbUser = userR.rows[0];
 
-    // Canonical tier
-    const tier_level = dbUser.tier_level ?? null;
-    const tier_label = tierLabelFromLevel(tier_level);
-
-    // ------------------------------------------------------------------------
-    // Deterministic operator selection (primary operator)
-    // primary = most recent active affiliation
-    // ------------------------------------------------------------------------
-    const affiliationQ = `
-      SELECT
-        a.operator_id,
-        a.affiliation_type,
-        a.created_at
-      FROM aquorix.user_operator_affiliations a
-      WHERE a.user_id = $1
-        AND a.active = true
-      ORDER BY a.created_at DESC
-      LIMIT 1;
-    `;
-
-    const affR = await pool.query(affiliationQ, [dbUser.user_id]);
-    const primaryAff = affR.rows[0] || null;
-
-    const operator_id = primaryAff?.operator_id ?? null;
-    const affiliation_type = primaryAff?.affiliation_type ?? null;
-
-    // Operator details (include logo_url for branding)
+    // Operator details (optional if operator_id missing)
     let operatorRow = null;
     if (operator_id) {
       const opQ = `
-        SELECT
-          operator_id,
-          name,
-          logo_url,
-          COALESCE(timezone, 'UTC') AS timezone
+        SELECT operator_id, name, COALESCE(timezone, 'UTC') AS timezone
         FROM aquorix.diveoperators
         WHERE operator_id = $1
         LIMIT 1;
@@ -280,7 +242,7 @@ router.get("/", requireAuth, async (req, res) => {
       operatorRow = opR.rows[0] || null;
     }
 
-    // Onboarding status (from pro_profiles.onboarding_metadata)
+    // Onboarding status
     const om = dbUser.onboarding_metadata || {};
     const current_step = om.current_step ?? null;
     const completed_steps = Array.isArray(om.completed_steps) ? om.completed_steps : [];
@@ -288,22 +250,19 @@ router.get("/", requireAuth, async (req, res) => {
       typeof om.completion_percentage === "number" ? om.completion_percentage : null;
 
     // STRICT completion rule (Phase B+):
-    const is_complete = om.is_complete === true || completion_percentage === 100;
-    const routing_hint = is_complete ? "dashboard" : "onboarding";
+    // Dashboard ONLY when explicitly sealed.
+    // - completion_percentage === 100 OR om.is_complete === true
+    // Everything else is onboarding.
+    const is_complete =
+      om.is_complete === true ||
+      completion_percentage === 100;
 
-    // Permissions:
-    // - Current enum values: staff, customer, freelance
-    // - For Phase B+: treat "staff" as operational access (Tier 2/3/4 will usually be staff on their operator)
-    // - customer is read-only.
-    // - freelance is read-only for now (until Phase C permissions matrix expands).
-    const can_manage_operator =
-      dbUser.role === "admin" ||
-      (affiliation_type === "staff" && (Number(tier_level) === 2 || Number(tier_level) === 3 || Number(tier_level) === 4));
+    const routing_hint = is_complete ? "dashboard" : "onboarding";
 
     const permissions = {
       can_view_schedule: true,
       can_edit_profile: true,
-      can_manage_operator,
+      can_manage_operator: affiliation === "owner" || affiliation === "admin",
     };
 
     return res.json({
@@ -317,29 +276,21 @@ router.get("/", requireAuth, async (req, res) => {
 
       aquorix_user: {
         user_id: dbUser.user_id,
-        tier_level: tier_level,
-        tier_label: tier_label,
+        tier: dbUser.tier || null,
         role: dbUser.role || "user",
         created_at: dbUser.created_at || null,
-
-        // NOTE: Keep legacy tier visible for debugging, but NOT for routing.
-        legacy_tier: dbUser.tier || null,
-
         profile: {
           first_name: dbUser.first_name || null,
           last_name: dbUser.last_name || null,
           phone: dbUser.phone || null,
-          business_name: dbUser.business_name || null,
-          pro_logo_url: dbUser.pro_logo_url || null,
         },
       },
 
       operator: {
         operator_id: operator_id || null,
         name: operatorRow?.name || null,
-        logo_url: operatorRow?.logo_url || null,
         timezone: operatorRow?.timezone || null,
-        affiliation_type: affiliation_type || null,
+        affiliation,
       },
 
       onboarding: {

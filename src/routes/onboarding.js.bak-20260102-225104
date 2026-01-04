@@ -2,50 +2,21 @@
 // Description: AQUORIX Onboarding API routes for user onboarding steps.
 // Author: Cascade AI (with Larry McLean) + ChatGPT Lead
 // Created: 2025-09-17
-// Version: 1.2.3
-// Last Updated: 2026-01-02
+// Last Updated: 2025-12-28
 // Status: Phase B+ — Backend-authoritative onboarding (Wizard = single writer)
 // Dependencies: express, pg (Pool)
 // Notes:
 //  - Step 1 persists identity into aquorix.users + aquorix.pro_profiles.
 //  - update-step persists onboarding_metadata and performs strict sealing at 100%.
-//  - update-step also hard-locks users.tier using aquorix.user_tier enum values.
-//  - Step 3: creates operator + affiliation in AQUORIX Postgres (bigint IDs), stores logo_url, no client DB writes.
-//  - user_tier enum labels (CONFIRMED): solo, entrepreneur, dive_center, complex, affiliate.
+//  - Step 3 (NEW): creates operator + affiliation in AQUORIX Postgres (bigint IDs), stores logo_url, no client DB writes.
+//  - affiliation_type enum labels are: staff, customer, freelance. MVP uses 'staff' as owner-equivalent membership.
 // Change Log:
 //   - 2025-09-17 (Cascade): Initial implementation of onboarding step 1 endpoint, transaction-safe upsert into users and pro_profiles.
 //   - 2025-12-27 (Larry + ChatGPT Lead): Phase B+ Gate 2 strict seal + optional tier_level persistence (canonical pro_profiles.tier_level)
 //   - 2025-12-28 (Larry + ChatGPT Lead): Added POST /api/onboarding/step3 (E2) to insert diveoperators + affiliations (staff) using bigint user_id resolution.
-//   - 2026-01-02 (Larry + ChatGPT Lead): HARD-LOCK Tier mapping in update-step: tier_level -> users.tier enum + logging.
 
 const express = require('express');
 const router = express.Router();
-
-/**
- * HARD LOCK: tier_level -> aquorix.user_tier enum label
- * Enum values (CONFIRMED in DB):
- *  - solo
- *  - entrepreneur
- *  - dive_center
- *  - complex
- *  - affiliate
- */
-function tierEnumFromLevel(level) {
-  switch (Number(level)) {
-    case 1:
-      return 'solo';
-    case 2:
-      return 'entrepreneur';
-    case 3:
-      return 'dive_center';
-    case 4:
-      return 'complex';
-    case 5:
-      return 'affiliate';
-    default:
-      return null;
-  }
-}
 
 /**
  * POST /api/onboarding/step1
@@ -154,6 +125,23 @@ router.get('/step1/:supabase_user_id', async (req, res) => {
 /**
  * POST /api/onboarding/step3
  * E2: Create operator + user affiliation (bigint IDs) and store logo_url in AQUORIX Postgres.
+ *
+ * Input (JSON):
+ *  - supabase_user_id (uuid string) REQUIRED
+ *  - tier_level (1..5) OPTIONAL (wizard often sets earlier via update-step)
+ *  - operator_name (string) REQUIRED for tiers 1..4 (for tier 5, may be provided or can be omitted)
+ *  - logo_url (string|null) OPTIONAL
+ *  - contact_info (jsonb) OPTIONAL
+ *  - website (string|null) OPTIONAL
+ *  - description (string|null) OPTIONAL
+ *  - is_test (boolean) OPTIONAL
+ *
+ * Output:
+ *  - success
+ *  - user_id (bigint)
+ *  - operator_id (bigint)
+ *  - affiliation_type ('staff')
+ *  - logo_url (string|null)
  */
 router.post('/step3', async (req, res) => {
   console.log('[step3] origin:', req.headers.origin);
@@ -176,11 +164,13 @@ router.post('/step3', async (req, res) => {
     return res.status(400).json({ error: 'Missing required field: supabase_user_id' });
   }
 
+  // For MVP, Step 3 is primarily for operator context (tiers 1..4).
+  // If your Tier 5 flow creates affiliates only, you can relax this later.
   if (!operator_name || typeof operator_name !== 'string' || !operator_name.trim()) {
     return res.status(400).json({ error: 'Missing required field: operator_name' });
   }
 
-  const operatorName = operator_name.trim().slice(0, 100);
+  const operatorName = operator_name.trim().slice(0, 100); // matches diveoperators.name varchar(100)
   const logoUrl = typeof logo_url === 'string' && logo_url.trim() ? logo_url.trim().slice(0, 255) : null;
   const websiteVal = typeof website === 'string' && website.trim() ? website.trim().slice(0, 255) : null;
   const descriptionVal = typeof description === 'string' && description.trim() ? description.trim() : null;
@@ -190,6 +180,7 @@ router.post('/step3', async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    // 1) Resolve bigint user_id
     const u = await client.query(
       `SELECT user_id FROM aquorix.users WHERE supabase_user_id = $1 LIMIT 1`,
       [supabase_user_id]
@@ -202,7 +193,7 @@ router.post('/step3', async (req, res) => {
 
     const userId = u.rows[0].user_id;
 
-    // OPTIONAL: persist tier_level (DB is King)
+    // 2) OPTIONAL: persist tier_level (DB is King)
     if (tier_level !== undefined && tier_level !== null) {
       const parsedTier = Number(tier_level);
       if (![1, 2, 3, 4, 5].includes(parsedTier)) {
@@ -221,7 +212,8 @@ router.post('/step3', async (req, res) => {
       );
     }
 
-    // Create or reuse operator
+    // 3) Create operator (or reuse latest operator created by user with same name)
+    // We prefer to avoid duplicates if user retries.
     let operatorId = null;
 
     const existingOp = await client.query(
@@ -238,6 +230,7 @@ router.post('/step3', async (req, res) => {
     if (existingOp.rowCount > 0) {
       operatorId = existingOp.rows[0].operator_id;
 
+      // Update mutable fields if provided (safe, idempotent)
       await client.query(
         `
         UPDATE aquorix.diveoperators
@@ -277,7 +270,8 @@ router.post('/step3', async (req, res) => {
       }
     }
 
-    // Create affiliation (owner-equivalent membership)
+    // 4) Create affiliation (MVP owner-equivalent membership)
+    // Enum labels confirmed: staff, customer, freelance. We use 'staff'.
     await client.query(
       `
       INSERT INTO aquorix.user_operator_affiliations
@@ -315,7 +309,6 @@ router.post('/step3', async (req, res) => {
 /**
  * POST /api/onboarding/update-step
  * Update onboarding progress in pro_profiles.onboarding_metadata
- * PLUS: HARD-LOCK users.tier using tier_level mapping when tier_level is provided.
  */
 router.post('/update-step', async (req, res) => {
   const pool = req.app.locals.pool;
@@ -351,7 +344,7 @@ router.post('/update-step', async (req, res) => {
 
     const userId = u.rows[0].user_id;
 
-    // OPTIONAL: Persist tier_level AND users.tier (HARD LOCK)
+    // OPTIONAL: Persist tier_level (DB is King)
     if (tier_level !== undefined && tier_level !== null) {
       const parsedTier = Number(tier_level);
 
@@ -364,21 +357,6 @@ router.post('/update-step', async (req, res) => {
         });
       }
 
-      const tierEnum = tierEnumFromLevel(parsedTier);
-      if (!tierEnum) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({
-          success: false,
-          error: `tier_level '${tier_level}' could not be mapped to users.tier`,
-        });
-      }
-
-      // LOG the exact enum label we will write
-      console.log(
-        `[update-step] supabase_user_id=${supabase_user_id} tier_level=${parsedTier} => users.tier='${tierEnum}' selected_tier='${selected_tier || ''}'`
-      );
-
-      // 1) pro_profiles tier_level
       await client.query(
         `
         UPDATE aquorix.pro_profiles
@@ -387,17 +365,6 @@ router.post('/update-step', async (req, res) => {
         WHERE user_id = $2
         `,
         [parsedTier, userId]
-      );
-
-      // 2) users.tier (enum)
-      await client.query(
-        `
-        UPDATE aquorix.users
-        SET tier = $1,
-            updated_at = NOW()
-        WHERE user_id = $2
-        `,
-        [tierEnum, userId]
       );
     }
 
