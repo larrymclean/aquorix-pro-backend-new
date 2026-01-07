@@ -1,0 +1,1 @@
+MVP LOCK (2026-01-05): Tier 5 affiliate onboarding steps 1–3 backend-authoritative. Step 3 stores country/website/description/contact_info under aquorix.pro_profiles.affiliate_details (JSONB). aquorix.affiliates row is created/updated. No client-side DB writes for business/affiliate entities.

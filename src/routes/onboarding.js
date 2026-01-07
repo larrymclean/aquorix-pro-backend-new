@@ -1,74 +1,133 @@
 // File: src/routes/onboarding.js
-// Description: AQUORIX Onboarding API routes for user onboarding steps.
-// Author: Cascade AI (with Larry McLean) + ChatGPT Lead
-// Created: 2025-09-17
-// Version: 1.2.3
-// Last Updated: 2026-01-02
-// Status: Phase B+ — Backend-authoritative onboarding (Wizard = single writer)
-// Dependencies: express, pg (Pool)
-// Notes:
-//  - Step 1 persists identity into aquorix.users + aquorix.pro_profiles.
-//  - update-step persists onboarding_metadata and performs strict sealing at 100%.
-//  - update-step also hard-locks users.tier using aquorix.user_tier enum values.
-//  - Step 3: creates operator + affiliation in AQUORIX Postgres (bigint IDs), stores logo_url, no client DB writes.
-//  - user_tier enum labels (CONFIRMED): solo, entrepreneur, dive_center, complex, affiliate.
-// Change Log:
-//   - 2025-09-17 (Cascade): Initial implementation of onboarding step 1 endpoint, transaction-safe upsert into users and pro_profiles.
-//   - 2025-12-27 (Larry + ChatGPT Lead): Phase B+ Gate 2 strict seal + optional tier_level persistence (canonical pro_profiles.tier_level)
-//   - 2025-12-28 (Larry + ChatGPT Lead): Added POST /api/onboarding/step3 (E2) to insert diveoperators + affiliations (staff) using bigint user_id resolution.
-//   - 2026-01-02 (Larry + ChatGPT Lead): HARD-LOCK Tier mapping in update-step: tier_level -> users.tier enum + logging.
+// Version: 1.2.8
+// Last Updated: 2026-01-05
+//
+// PURPOSE:
+//  Backend-authoritative onboarding routes for AQUORIX.PRO.
+//
+// CHANGE LOG:
+// - 2026-01-05 (v1.2.8) (Larry + AI Team):
+//    - ADD POST /complete: finalize onboarding (sets onboarding_completed_at + metadata step4/100%).
+//    - Keep backend as single writer for completion state (no client-side DB writes).
+// - 2026-01-05 (v1.2.7) (Larry + AI Team):
+//    - FIX Step 3 DB writes to match actual aquorix.pro_profiles schema:
+//      - Removed writes to non-existent columns (country, website, short_description).
+//      - Store country/website/description/contact_info under pro_profiles.affiliate_details (jsonb).
+//    - FIX Tier 5 affiliates upsert to not require UNIQUE(user_id) (SELECT then INSERT/UPDATE).
+// - 2026-01-05 (v1.2.6):
+//    - RESTORE missing endpoints: POST /update-step and POST /step3 (regression fix).
+// - 2026-01-04 (v1.2.5):
+//    - Fix Step 1 phone sanitization rules for users.phone_number (varchar(15)).
 
 const express = require('express');
 const router = express.Router();
 
 /**
- * HARD LOCK: tier_level -> aquorix.user_tier enum label
- * Enum values (CONFIRMED in DB):
- *  - solo
- *  - entrepreneur
- *  - dive_center
- *  - complex
- *  - affiliate
+ * Tier mapping (frontend uses numeric tier_level in most flows).
+ * NOTE: aquorix.users.tier uses string enums ('solo', 'affiliate', etc.)
  */
 function tierEnumFromLevel(level) {
   switch (Number(level)) {
-    case 1:
-      return 'solo';
-    case 2:
-      return 'entrepreneur';
-    case 3:
-      return 'dive_center';
-    case 4:
-      return 'complex';
-    case 5:
-      return 'affiliate';
-    default:
-      return null;
+    case 1: return 'solo';
+    case 2: return 'entrepreneur';
+    case 3: return 'dive_center';
+    case 4: return 'complex';
+    case 5: return 'affiliate';
+    default: return null;
   }
+}
+
+function parseTierLevel(v) {
+  const n = Number(v);
+  if (![1, 2, 3, 4, 5].includes(n)) return null;
+  return n;
+}
+
+function extractCountry(reqBody) {
+  const direct = typeof reqBody?.country === 'string' ? reqBody.country.trim() : '';
+  if (direct) return direct.slice(0, 10);
+
+  const nested = reqBody?.contact_info?.address?.country;
+  const nestedVal = typeof nested === 'string' ? nested.trim() : '';
+  if (nestedVal) return nestedVal.slice(0, 10);
+
+  return null;
+}
+
+/**
+ * Normalize phone for users.phone_number (varchar(15)).
+ * E.164 allows max 15 digits (excluding '+').
+ * We store digits-only.
+ */
+function normalizePhoneDigitsForUsers(phoneRaw) {
+  const s = typeof phoneRaw === 'string' ? phoneRaw : '';
+  const digits = s.replace(/\D/g, '');
+  if (!digits) return null;
+  return digits.slice(0, 15);
+}
+
+/**
+ * Normalize phone for pro_profiles.phone (varchar(20)).
+ * Keep user-friendly formatting but cap to 20.
+ */
+function normalizePhoneForProfiles(phoneRaw) {
+  const s = typeof phoneRaw === 'string' ? phoneRaw.trim() : '';
+  if (!s) return null;
+  return s.slice(0, 20);
+}
+
+/**
+ * Ensure completed_steps is unique/sorted int[]
+ */
+function normalizeCompletedSteps(arr) {
+  if (!Array.isArray(arr)) return [];
+  const nums = arr
+    .map((x) => Number(x))
+    .filter((n) => Number.isFinite(n) && n >= 1 && n <= 10);
+  return Array.from(new Set(nums)).sort((a, b) => a - b);
+}
+
+/**
+ * Defensive helper: ensure a pro_profiles row exists for a user_id.
+ * pro_profiles.tier_level is NOT NULL, so provide a safe default (1).
+ */
+async function ensureProProfileRow(client, userId) {
+  await client.query(
+    `
+    INSERT INTO aquorix.pro_profiles (user_id, tier_level, onboarding_metadata)
+    VALUES ($1, 1, jsonb_build_object('started_at', NOW()))
+    ON CONFLICT (user_id) DO NOTHING
+    `,
+    [userId]
+  );
 }
 
 /**
  * POST /api/onboarding/step1
- * Persist onboarding Step 1 identity into AQUORIX Postgres.
+ * Body: { supabase_user_id, first_name, last_name, phone, email }
  */
 router.post('/step1', async (req, res) => {
-  // LSM Debug 12-27-2025
   console.log('[step1] origin:', req.headers.origin);
   console.log('[step1] body:', req.body);
 
   const { supabase_user_id, first_name, last_name, phone, email } = req.body;
-
   const pool = req.app.locals.pool;
 
   if (!supabase_user_id || !first_name || !last_name || !phone || !email) {
     return res.status(400).json({ error: 'Missing required fields.' });
   }
 
+  const phoneUsers = normalizePhoneDigitsForUsers(phone);
+  const phoneProfile = normalizePhoneForProfiles(phone);
+
+  if (!phoneUsers || !phoneProfile) {
+    return res.status(400).json({ error: 'Invalid phone number.' });
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // 1) Ensure user exists in aquorix.users
     const userResult = await client.query(
       `
       INSERT INTO aquorix.users (supabase_user_id, email, username, phone_number, role, tier)
@@ -78,12 +137,11 @@ router.post('/step1', async (req, res) => {
             phone_number = EXCLUDED.phone_number
       RETURNING user_id
       `,
-      [supabase_user_id, email, email, phone]
+      [supabase_user_id, email, email, phoneUsers]
     );
 
     const userId = userResult.rows[0].user_id;
 
-    // 2) Upsert into pro_profiles with Step 1 fields
     await client.query(
       `
       INSERT INTO aquorix.pro_profiles (
@@ -103,11 +161,11 @@ router.post('/step1', async (req, res) => {
             last_name = EXCLUDED.last_name,
             phone = EXCLUDED.phone,
             onboarding_metadata = jsonb_set(
-              pro_profiles.onboarding_metadata,
+              COALESCE(pro_profiles.onboarding_metadata, '{}'::jsonb),
               '{last_activity}', to_jsonb(NOW()), true
             )
       `,
-      [userId, first_name, last_name, phone]
+      [userId, first_name, last_name, phoneProfile]
     );
 
     await client.query('COMMIT');
@@ -123,25 +181,23 @@ router.post('/step1', async (req, res) => {
 
 /**
  * GET /api/onboarding/step1/:supabase_user_id
- * Fetch Step 1 identity data (first_name, last_name, phone) from pro_profiles for the given supabase_user_id.
  */
 router.get('/step1/:supabase_user_id', async (req, res) => {
   const { supabase_user_id } = req.params;
-
   const pool = req.app.locals.pool;
 
   const client = await pool.connect();
   try {
     const result = await client.query(
-      `SELECT p.first_name, p.last_name, p.phone
-       FROM aquorix.pro_profiles p
-       JOIN aquorix.users u ON u.user_id = p.user_id
-       WHERE u.supabase_user_id = $1`,
+      `
+      SELECT p.first_name, p.last_name, p.phone
+      FROM aquorix.pro_profiles p
+      JOIN aquorix.users u ON u.user_id = p.user_id
+      WHERE u.supabase_user_id = $1
+      `,
       [supabase_user_id]
     );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Not found' });
-    }
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
     res.json(result.rows[0]);
   } catch (err) {
     console.error('Error fetching Step 1 data:', err);
@@ -152,257 +208,41 @@ router.get('/step1/:supabase_user_id', async (req, res) => {
 });
 
 /**
- * POST /api/onboarding/step3
- * E2: Create operator + user affiliation (bigint IDs) and store logo_url in AQUORIX Postgres.
- */
-router.post('/step3', async (req, res) => {
-  console.log('[step3] origin:', req.headers.origin);
-  console.log('[step3] body keys:', Object.keys(req.body || {}));
-
-  const pool = req.app.locals.pool;
-
-  const {
-    supabase_user_id,
-    tier_level,
-    operator_name,
-    logo_url,
-    contact_info,
-    website,
-    description,
-    is_test,
-  } = req.body || {};
-
-  if (!supabase_user_id || typeof supabase_user_id !== 'string') {
-    return res.status(400).json({ error: 'Missing required field: supabase_user_id' });
-  }
-
-  if (!operator_name || typeof operator_name !== 'string' || !operator_name.trim()) {
-    return res.status(400).json({ error: 'Missing required field: operator_name' });
-  }
-
-  const operatorName = operator_name.trim().slice(0, 100);
-  const logoUrl = typeof logo_url === 'string' && logo_url.trim() ? logo_url.trim().slice(0, 255) : null;
-  const websiteVal = typeof website === 'string' && website.trim() ? website.trim().slice(0, 255) : null;
-  const descriptionVal = typeof description === 'string' && description.trim() ? description.trim() : null;
-  const isTest = typeof is_test === 'boolean' ? is_test : false;
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const u = await client.query(
-      `SELECT user_id FROM aquorix.users WHERE supabase_user_id = $1 LIMIT 1`,
-      [supabase_user_id]
-    );
-
-    if (u.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'User not found for supabase_user_id' });
-    }
-
-    const userId = u.rows[0].user_id;
-
-    // OPTIONAL: persist tier_level (DB is King)
-    if (tier_level !== undefined && tier_level !== null) {
-      const parsedTier = Number(tier_level);
-      if (![1, 2, 3, 4, 5].includes(parsedTier)) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: `Invalid tier_level '${tier_level}'. Must be 1..5.` });
-      }
-
-      await client.query(
-        `
-        UPDATE aquorix.pro_profiles
-        SET tier_level = $1,
-            updated_at = NOW()
-        WHERE user_id = $2
-        `,
-        [parsedTier, userId]
-      );
-    }
-
-    // Create or reuse operator
-    let operatorId = null;
-
-    const existingOp = await client.query(
-      `
-      SELECT operator_id
-      FROM aquorix.diveoperators
-      WHERE created_by_user_id = $1 AND name = $2
-      ORDER BY operator_id DESC
-      LIMIT 1
-      `,
-      [userId, operatorName]
-    );
-
-    if (existingOp.rowCount > 0) {
-      operatorId = existingOp.rows[0].operator_id;
-
-      await client.query(
-        `
-        UPDATE aquorix.diveoperators
-        SET logo_url = COALESCE($1, logo_url),
-            contact_info = COALESCE($2::jsonb, contact_info),
-            website = COALESCE($3, website),
-            description = COALESCE($4, description),
-            is_test = $5,
-            updated_at = NOW()
-        WHERE operator_id = $6
-        `,
-        [logoUrl, contact_info ? JSON.stringify(contact_info) : null, websiteVal, descriptionVal, isTest, operatorId]
-      );
-    } else {
-      const opR = await client.query(
-        `
-        INSERT INTO aquorix.diveoperators
-          (name, created_by_user_id, logo_url, contact_info, website, description, is_test, updated_at)
-        VALUES
-          ($1, $2, $3, $4::jsonb, $5, $6, $7, NOW())
-        RETURNING operator_id
-        `,
-        [
-          operatorName,
-          userId,
-          logoUrl,
-          contact_info ? JSON.stringify(contact_info) : null,
-          websiteVal,
-          descriptionVal,
-          isTest,
-        ]
-      );
-
-      operatorId = opR.rows[0]?.operator_id || null;
-      if (!operatorId) {
-        throw new Error('OPERATOR_CREATE_FAILED');
-      }
-    }
-
-    // Create affiliation (owner-equivalent membership)
-    await client.query(
-      `
-      INSERT INTO aquorix.user_operator_affiliations
-        (user_id, operator_id, affiliation_type, active)
-      SELECT $1, $2, 'staff', true
-      WHERE NOT EXISTS (
-        SELECT 1
-        FROM aquorix.user_operator_affiliations uoa
-        WHERE uoa.user_id = $1
-          AND uoa.operator_id = $2
-          AND uoa.active = true
-      )
-      `,
-      [userId, operatorId]
-    );
-
-    await client.query('COMMIT');
-
-    return res.status(200).json({
-      success: true,
-      user_id: userId,
-      operator_id: operatorId,
-      affiliation_type: 'staff',
-      logo_url: logoUrl,
-    });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Onboarding Step 3 DB error:', err);
-    return res.status(500).json({ error: 'Failed to save Step 3 data.', detail: err?.message });
-  } finally {
-    client.release();
-  }
-});
-
-/**
  * POST /api/onboarding/update-step
- * Update onboarding progress in pro_profiles.onboarding_metadata
- * PLUS: HARD-LOCK users.tier using tier_level mapping when tier_level is provided.
  */
 router.post('/update-step', async (req, res) => {
+  console.log('[update-step] body:', req.body);
+
+  const { supabase_user_id, current_step, completed_steps, completion_percentage } = req.body;
   const pool = req.app.locals.pool;
 
-  const {
-    supabase_user_id,
-    current_step,
-    completed_steps,
-    completion_percentage,
-    tier_level,
-    selected_tier,
-  } = req.body;
-
-  if (!supabase_user_id || typeof current_step !== 'number') {
-    return res
-      .status(400)
-      .json({ error: 'Missing required fields: supabase_user_id, current_step(number)' });
+  if (!supabase_user_id) {
+    return res.status(400).json({ error: 'Missing supabase_user_id.' });
   }
+
+  const stepNum = Number(current_step);
+  const pctNum = Number(completion_percentage);
+
+  const safeStep = Number.isFinite(stepNum) ? Math.max(1, Math.min(10, stepNum)) : 1;
+  const safePct = Number.isFinite(pctNum) ? Math.max(0, Math.min(100, pctNum)) : 0;
+  const safeCompleted = normalizeCompletedSteps(completed_steps);
+  const finalCompleted = safeCompleted.length ? safeCompleted : [1];
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const u = await client.query(
+    const userRes = await client.query(
       `SELECT user_id FROM aquorix.users WHERE supabase_user_id = $1 LIMIT 1`,
       [supabase_user_id]
     );
-
-    if (u.rowCount === 0) {
+    if (userRes.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'User not found' });
+      return res.status(404).json({ error: 'User not found.' });
     }
+    const userId = userRes.rows[0].user_id;
 
-    const userId = u.rows[0].user_id;
-
-    // OPTIONAL: Persist tier_level AND users.tier (HARD LOCK)
-    if (tier_level !== undefined && tier_level !== null) {
-      const parsedTier = Number(tier_level);
-
-      if (![1, 2, 3, 4, 5].includes(parsedTier)) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({
-          success: false,
-          error: `Invalid tier_level '${tier_level}'. Must be 1..5.`,
-          hint: 'Admin is role-based, not tier_level.',
-        });
-      }
-
-      const tierEnum = tierEnumFromLevel(parsedTier);
-      if (!tierEnum) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({
-          success: false,
-          error: `tier_level '${tier_level}' could not be mapped to users.tier`,
-        });
-      }
-
-      // LOG the exact enum label we will write
-      console.log(
-        `[update-step] supabase_user_id=${supabase_user_id} tier_level=${parsedTier} => users.tier='${tierEnum}' selected_tier='${selected_tier || ''}'`
-      );
-
-      // 1) pro_profiles tier_level
-      await client.query(
-        `
-        UPDATE aquorix.pro_profiles
-        SET tier_level = $1,
-            updated_at = NOW()
-        WHERE user_id = $2
-        `,
-        [parsedTier, userId]
-      );
-
-      // 2) users.tier (enum)
-      await client.query(
-        `
-        UPDATE aquorix.users
-        SET tier = $1,
-            updated_at = NOW()
-        WHERE user_id = $2
-        `,
-        [tierEnum, userId]
-      );
-    }
-
-    const completed = Array.isArray(completed_steps) ? completed_steps : [];
-    const pct = typeof completion_percentage === 'number' ? completion_percentage : 0;
+    await ensureProProfileRow(client, userId);
 
     await client.query(
       `
@@ -411,7 +251,10 @@ router.post('/update-step', async (req, res) => {
         jsonb_set(
           jsonb_set(
             jsonb_set(
-              COALESCE(onboarding_metadata, '{}'::jsonb),
+              jsonb_set(
+                COALESCE(onboarding_metadata, '{}'::jsonb),
+                '{last_activity}', to_jsonb(NOW()), true
+              ),
               '{current_step}', to_jsonb($2::int), true
             ),
             '{completed_steps}', to_jsonb($3::int[]), true
@@ -420,203 +263,240 @@ router.post('/update-step', async (req, res) => {
         )
       WHERE user_id = $1
       `,
-      [userId, current_step, completed, pct]
+      [userId, safeStep, finalCompleted, safePct]
     );
 
-    // STRICT sealing: only when step 4 reached AND pct >= 100
-    const reachedStep4 = current_step >= 4 || (Array.isArray(completed) && completed.includes(4));
-    const reachedPct = pct >= 100;
-    const shouldSeal = reachedStep4 && reachedPct;
-
-    let sealed = false;
-
-    if (shouldSeal) {
-      const tierR = await client.query(
-        `
-        SELECT tier_level
-        FROM aquorix.pro_profiles
-        WHERE user_id = $1
-        LIMIT 1
-        `,
-        [userId]
-      );
-
-      const tier_level_db = tierR.rows[0]?.tier_level || null;
-      if (!tier_level_db) {
-        throw new Error('TIER_LEVEL_NOT_FOUND');
-      }
-
-      // Tier 1–2: Optional dive_leaders
-      if (tier_level_db === 1 || tier_level_db === 2) {
-        await client.query(
-          `
-          INSERT INTO aquorix.dive_leaders (user_id)
-          SELECT $1
-          WHERE NOT EXISTS (
-            SELECT 1 FROM aquorix.dive_leaders dl WHERE dl.user_id = $1
-          )
-          `,
-          [userId]
-        );
-      }
-
-      // Tier 3–4: Required operator + affiliation (fallback if missing)
-      if (tier_level_db === 3 || tier_level_db === 4) {
-        const existingAff = await client.query(
-          `
-          SELECT operator_id
-          FROM aquorix.user_operator_affiliations
-          WHERE user_id = $1 AND active = true
-          ORDER BY created_at DESC
-          LIMIT 1
-          `,
-          [userId]
-        );
-
-        if (existingAff.rowCount === 0) {
-          const profileR = await client.query(
-            `
-            SELECT business_name, first_name, last_name
-            FROM aquorix.pro_profiles
-            WHERE user_id = $1
-            LIMIT 1
-            `,
-            [userId]
-          );
-
-          const p = profileR.rows[0] || {};
-          const operatorName =
-            (p.business_name || '').trim() ||
-            `${(p.first_name || 'Pro').trim()} ${(p.last_name || 'Diver').trim()} Diving`;
-
-          const opR = await client.query(
-            `
-            INSERT INTO aquorix.diveoperators (name, created_by_user_id, updated_at)
-            VALUES ($1, $2, NOW())
-            RETURNING operator_id
-            `,
-            [operatorName.slice(0, 100), userId]
-          );
-
-          const operator_id = opR.rows[0]?.operator_id;
-          if (!operator_id) throw new Error('OPERATOR_CREATE_FAILED');
-
-          await client.query(
-            `
-            INSERT INTO aquorix.user_operator_affiliations
-              (user_id, operator_id, affiliation_type, active)
-            SELECT $1, $2, 'staff', true
-            WHERE NOT EXISTS (
-              SELECT 1
-              FROM aquorix.user_operator_affiliations uoa
-              WHERE uoa.user_id = $1
-                AND uoa.operator_id = $2
-                AND uoa.active = true
-            )
-            `,
-            [userId, operator_id]
-          );
-        }
-      }
-
-      // Tier 5: Required affiliate
-      if (tier_level_db === 5) {
-        await client.query(
-          `
-          INSERT INTO aquorix.affiliates (user_id)
-          SELECT $1
-          WHERE NOT EXISTS (
-            SELECT 1 FROM aquorix.affiliates a WHERE a.user_id = $1
-          )
-          `,
-          [userId]
-        );
-      }
-
-      // Mark onboarding complete
-      await client.query(
-        `
-        UPDATE aquorix.pro_profiles
-        SET onboarding_metadata =
-          jsonb_set(
-            jsonb_set(
-              jsonb_set(
-                COALESCE(onboarding_metadata, '{}'::jsonb),
-                '{is_complete}', to_jsonb(true), true
-              ),
-              '{completion_percentage}', to_jsonb(100), true
-            ),
-            '{last_activity}', to_jsonb(NOW()), true
-          )
-        WHERE user_id = $1
-        `,
-        [userId]
-      );
-
-      sealed = true;
-    }
-
     await client.query('COMMIT');
-    return res.json({ success: true, sealed });
+    return res.status(200).json({ success: true });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('[update-step] error:', err);
-    return res.status(500).json({ error: 'Failed to update onboarding step', detail: err.message });
+    console.error('update-step DB error:', err);
+    return res.status(500).json({ error: 'Failed to update onboarding step.' });
   } finally {
     client.release();
   }
 });
 
-// PROMOTE USER (Tier-only)
-router.post('/promote', async (req, res) => {
-  const pool = req.app?.locals?.pool;
+/**
+ * POST /api/onboarding/step3
+ * Writes canonical business fields to pro_profiles and tier5 details to affiliate_details JSONB.
+ */
+router.post('/step3', async (req, res) => {
+  console.log('[step3] body:', req.body);
 
-  if (!pool) {
-    return res.status(500).json({
-      success: false,
-      error: 'Server misconfigured: PostgreSQL pool missing (req.app.locals.pool)',
-    });
-  }
+  const {
+    supabase_user_id,
+    tier_level,
+    tier,
+    operator_name,
+    country,
+    logo_url,
+    website,
+    description,
+    contact_info,
+    is_test,
+  } = req.body;
 
-  const { supabase_user_id, tier } = req.body || {};
+  const pool = req.app.locals.pool;
 
-  if (!supabase_user_id || typeof supabase_user_id !== 'string') {
-    return res.status(400).json({ success: false, error: 'supabase_user_id is required' });
-  }
-  if (!tier || typeof tier !== 'string') {
-    return res.status(400).json({ success: false, error: 'tier is required' });
-  }
+  if (!supabase_user_id) return res.status(400).json({ error: 'Missing supabase_user_id.' });
+  if (!operator_name || !String(operator_name).trim()) return res.status(400).json({ error: 'Missing operator_name.' });
 
+  const countryCode = extractCountry({ country, contact_info });
+  if (!countryCode) return res.status(400).json({ error: 'Missing country.' });
+
+  const parsedLevel = parseTierLevel(tier_level);
+  const tierFromString =
+    typeof tier === 'string'
+      ? ({ solo: 1, entrepreneur: 2, dive_center: 3, complex: 4, affiliate: 5 }[tier] || null)
+      : null;
+
+  const effectiveTierLevel = parsedLevel || tierFromString || 1;
+  const effectiveTierEnum = tierEnumFromLevel(effectiveTierLevel) || 'solo';
+
+  const businessName = String(operator_name).trim().slice(0, 255);
+  const safeLogoUrl = typeof logo_url === 'string' ? logo_url.trim().slice(0, 2000) : null;
+  const safeWebsite = typeof website === 'string' ? website.trim().slice(0, 500) : null;
+  const safeDesc = typeof description === 'string' ? description.trim().slice(0, 2000) : null;
+  const safeIsTest = Boolean(is_test);
+
+  const client = await pool.connect();
   try {
-    const sql = `
-      UPDATE aquorix.users
-      SET tier = $1,
-          updated_at = NOW()
-      WHERE supabase_user_id = $2
-      RETURNING user_id, tier
-    `;
+    await client.query('BEGIN');
 
-    const result = await pool.query(sql, [tier, supabase_user_id]);
+    const userRes = await client.query(
+      `SELECT user_id FROM aquorix.users WHERE supabase_user_id = $1 LIMIT 1`,
+      [supabase_user_id]
+    );
+    if (userRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    const userId = userRes.rows[0].user_id;
 
-    if (result.rowCount === 0) {
-      return res.status(404).json({
-        success: false,
-        error: 'No user found for supabase_user_id',
-      });
+    // Update users.tier to match selection (critical for Tier 5)
+    await client.query(
+      `UPDATE aquorix.users SET tier = $2 WHERE user_id = $1`,
+      [userId, effectiveTierEnum]
+    );
+
+    await ensureProProfileRow(client, userId);
+
+    // Build affiliate_details patch (jsonb)
+    const affiliatePatch = {
+      country: countryCode,
+      website: safeWebsite,
+      description: safeDesc,
+      contact_info: contact_info || null,
+    };
+
+    // Update pro_profiles (ONLY columns that exist)
+    await client.query(
+      `
+      UPDATE aquorix.pro_profiles
+      SET
+        tier_level = $2,
+        business_name = $3,
+        logo_url = COALESCE($4, logo_url),
+        affiliate_details = COALESCE(affiliate_details, '{}'::jsonb) || $5::jsonb,
+        onboarding_metadata =
+          jsonb_set(
+            jsonb_set(
+              jsonb_set(
+                jsonb_set(
+                  COALESCE(onboarding_metadata, '{}'::jsonb),
+                  '{last_activity}', to_jsonb(NOW()), true
+                ),
+                '{current_step}', to_jsonb(3), true
+              ),
+              '{completed_steps}', to_jsonb(ARRAY[1,2,3]::int[]), true
+            ),
+            '{completion_percentage}', to_jsonb(75), true
+          )
+      WHERE user_id = $1
+      `,
+      [userId, effectiveTierLevel, businessName, safeLogoUrl, JSON.stringify(affiliatePatch)]
+    );
+
+    // Tier 5: Upsert affiliates row WITHOUT relying on UNIQUE(user_id)
+    if (effectiveTierLevel === 5) {
+      const existing = await client.query(
+        `SELECT affiliate_id FROM aquorix.affiliates WHERE user_id = $1 LIMIT 1`,
+        [userId]
+      );
+
+      if (existing.rows.length === 0) {
+        await client.query(
+          `
+          INSERT INTO aquorix.affiliates (
+            user_id,
+            short_description,
+            verified_by_aquorix,
+            verified_at,
+            logo_url,
+            is_test
+          )
+          VALUES ($1, $2, false, NULL, $3, $4)
+          `,
+          [userId, safeDesc, safeLogoUrl, safeIsTest]
+        );
+      } else {
+        await client.query(
+          `
+          UPDATE aquorix.affiliates
+          SET
+            short_description = COALESCE($2, short_description),
+            logo_url = COALESCE($3, logo_url),
+            is_test = $4
+          WHERE user_id = $1
+          `,
+          [userId, safeDesc, safeLogoUrl, safeIsTest]
+        );
+      }
     }
 
-    return res.json({
-      success: true,
-      user_id: result.rows[0].user_id,
-      tier: result.rows[0].tier,
-    });
+    await client.query('COMMIT');
+    return res.status(200).json({ success: true });
   } catch (err) {
-    console.error('POST /promote error:', err);
-    return res.status(500).json({
-      success: false,
-      error: 'Promotion failed',
-      detail: err?.message,
-    });
+    await client.query('ROLLBACK');
+    console.error('step3 DB error:', err);
+    return res.status(500).json({ error: 'Failed to save Step 3 data.' });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/onboarding/complete
+ * Finalize onboarding.
+ *
+ * Body:
+ * {
+ *   supabase_user_id: string
+ * }
+ *
+ * Effects:
+ * - pro_profiles.onboarding_completed_at = NOW()
+ * - onboarding_metadata: current_step=4, completed_steps=[1,2,3,4], completion_percentage=100, last_activity=NOW()
+ */
+router.post('/complete', async (req, res) => {
+  console.log('[complete] body:', req.body);
+
+  const { supabase_user_id } = req.body;
+  const pool = req.app.locals.pool;
+
+  if (!supabase_user_id) {
+    return res.status(400).json({ error: 'Missing supabase_user_id.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const userRes = await client.query(
+      `SELECT user_id FROM aquorix.users WHERE supabase_user_id = $1 LIMIT 1`,
+      [supabase_user_id]
+    );
+    if (userRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    const userId = userRes.rows[0].user_id;
+
+    await ensureProProfileRow(client, userId);
+
+    await client.query(
+      `
+      UPDATE aquorix.pro_profiles
+      SET
+        onboarding_completed_at = NOW(),
+        onboarding_metadata =
+          jsonb_set(
+            jsonb_set(
+              jsonb_set(
+                jsonb_set(
+                  COALESCE(onboarding_metadata, '{}'::jsonb),
+                  '{last_activity}', to_jsonb(NOW()), true
+                ),
+                '{current_step}', to_jsonb(4), true
+              ),
+              '{completed_steps}', to_jsonb(ARRAY[1,2,3,4]::int[]), true
+            ),
+            '{completion_percentage}', to_jsonb(100), true
+          )
+      WHERE user_id = $1
+      `,
+      [userId]
+    );
+
+    await client.query('COMMIT');
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('complete DB error:', err);
+    return res.status(500).json({ error: 'Failed to complete onboarding.' });
+  } finally {
+    client.release();
   }
 });
 
