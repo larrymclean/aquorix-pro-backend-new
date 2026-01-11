@@ -5,9 +5,9 @@
  * File:        src/routes/me.js
  * Purpose:     Single source of truth for authenticated user identity, operator
  *              context, affiliate context, onboarding status, and permission flags.
- * Version:     v1.0.7
+ * Version:     v1.0.6
  * Created:     2025-12-23
- * Updated:     2026-01-07
+ * Updated:     2026-01-05
  * Author:      Larry McLean
  * Project:     AQUORIX™ API Project
  *
@@ -18,15 +18,6 @@
  * - Tier 0: Internal Admin (AQUORIX staff) — routes to /admin/* and overrides onboarding.
  * - Tier 1–4: operator context from most recent active affiliation
  * - Tier 5: affiliate context from aquorix.affiliates; operator MUST be null
- *
- * Smart Dashboard Contract Notes (Locked v1):
- * - /api/v1/me is the boot authority for routing_hint + ui_mode + permissions.
- * - Canonical keys added (append-only; legacy keys preserved temporarily):
- *   - api_version: "v1"
- *   - user: { user_id, email, tier_level }
- *   - ui_mode: "admin" | "pro" | "affiliate"
- *   - permissions: Record<string, boolean> (missing keys treated as false by frontend)
- * - Frontend MUST consume canonical keys only; legacy keys may remain for transition/debug.
  *
  * Change Log:
  * -----------
@@ -40,12 +31,8 @@
  * v1.0.5 - 2026-01-05 - Larry McLean + ChatGPT Lead
  *   - Tier 0 precedence: tier_level === 0 ALWAYS routes admin, bypasses onboarding checks
  *   - Adds internal_admin object + deterministic permissions for Tier 0
- * v1.0.6 - 2026-01-06 - Larry McLean + AI Team
- *   - Added ui_mode to prevent future ambiguity (Tier 0)
- * v1.0.7 - 2026-01-07 - Larry McLean + AI Team
- *   - Added canonical Smart Dashboard keys: api_version + user (minimal) + ui_mode for all tiers
- *   - Added cache-control no-store for /me boot endpoint
- *   - Normalized base permission flags (append-only; legacy behavior preserved)
+ * v1.0.6 = 2026-01-06 - Larry McLean + AI Team
+ *  - Added ui_mode to prevent future ambiguity
  * ============================================================================
  */
 
@@ -57,8 +44,6 @@ const requireAuth = require("../middleware/auth");
 if (typeof requireAuth !== "function") {
   throw new Error("Middleware load error: requireAuth is not a function.");
 }
-
-const API_VERSION = "v1";
 
 function tierLabelFromLevel(tier_level) {
   const t = Number(tier_level);
@@ -125,9 +110,6 @@ function deriveAdminPermissions(admin_level) {
 
 router.get("/", requireAuth, async (req, res) => {
   try {
-    // Boot endpoints should not be cached
-    res.set("Cache-Control", "no-store");
-
     const pool = req.app?.locals?.pool;
     if (!pool) {
       return res.status(500).json({ ok: false, error: "DB_POOL_MISSING" });
@@ -278,23 +260,6 @@ router.get("/", requireAuth, async (req, res) => {
     const tier_level = dbUser.tier_level ?? null;
     const tier_label = tierLabelFromLevel(tier_level);
 
-    // Canonical (minimal) user object for Smart Dashboard consumption
-    const canonical_user = {
-      user_id: Number(dbUser.user_id),
-      email: dbUser.email || email_from_jwt || null,
-      tier_level: Number(tier_level),
-
-      // NEW (append-only)
-      display_name:
-        [dbUser.first_name, dbUser.last_name].filter(Boolean).join(' ') ||
-        dbUser.email ||
-        null,
-
-      avatar_url:
-        dbUser.pro_logo_url ||
-        null
-    };
-
     // Onboarding status (default behavior)
     const om = dbUser.onboarding_metadata || {};
     const current_step_default = om.current_step ?? null;
@@ -338,18 +303,9 @@ router.get("/", requireAuth, async (req, res) => {
           : null;
 
       return res.json({
-        api_version: API_VERSION,
-
         ok: true,
         authenticated: true,
 
-        // Canonical keys (frontend consumes)
-        routing_hint: "dashboard",
-        ui_mode: "admin",
-        user: canonical_user,
-        permissions,
-
-        // Legacy / context keys (kept for transition)
         identity: {
           supabase_user_id,
           email: dbUser.email || email_from_jwt,
@@ -376,9 +332,14 @@ router.get("/", requireAuth, async (req, res) => {
         operator: null,
         affiliate: null,
 
-        internal_admin, // Tier 0 only
+        internal_admin, // NEW: Tier 0 only
+
         onboarding,
 
+        routing_hint: "dashboard",
+        ui_mode: "admin",
+
+        permissions,
         server_time_utc: new Date().toISOString(),
       });
     }
@@ -458,47 +419,23 @@ router.get("/", requireAuth, async (req, res) => {
       };
     }
 
-    // Permissions (simple, deterministic) — append-only normalization
+    // Permissions (simple, deterministic)
     const can_manage_operator =
       dbUser.role === "admin" ||
       (operator?.affiliation_type === "staff" &&
         (Number(tier_level) === 2 || Number(tier_level) === 3 || Number(tier_level) === 4));
 
-    const isAffiliate = Number(tier_level) === 5;
-    const isOperatorTier = Number(tier_level) >= 1 && Number(tier_level) <= 4;
-
     const permissions = {
-      // Normalize these so the shell can depend on them
-      can_use_admin_tools: false,
-      can_use_operator_tools: Boolean(isOperatorTier),
-      can_use_affiliate_tools: Boolean(isAffiliate),
-
-      // Existing behavior preserved
       can_view_schedule: true,
       can_edit_profile: true,
       can_manage_operator: Boolean(can_manage_operator),
-
-      // Keep admin-flavored flags present but false (prevents undefined checks)
-      can_edit: false,
-      can_approve: false,
-      can_modify_config: false,
+      can_use_affiliate_tools: Number(tier_level) === 5,
     };
 
-    const ui_mode = isAffiliate ? "affiliate" : "pro";
-
     return res.json({
-      api_version: API_VERSION,
-
       ok: true,
       authenticated: true,
 
-      // Canonical keys (frontend consumes)
-      routing_hint: routing_hint_default,
-      ui_mode,
-      user: canonical_user,
-      permissions,
-
-      // Legacy / context keys (kept for transition)
       identity: {
         supabase_user_id,
         email: dbUser.email || email_from_jwt,
@@ -532,6 +469,8 @@ router.get("/", requireAuth, async (req, res) => {
         is_complete: is_complete_default,
       },
 
+      routing_hint: routing_hint_default,
+      permissions,
       server_time_utc: new Date().toISOString(),
     });
   } catch (err) {
