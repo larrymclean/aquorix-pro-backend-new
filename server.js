@@ -10,6 +10,8 @@
  *     - Fix "Cannot access 'app' before initialization"
  *     - Remove duplicate CORS blocks (single source of truth)
  *     - Allow Swagger UI origin (http://localhost:3001) to prevent self-blocking
+ *  - 2026-01-12 - v1.0.9 - (larry/ChatGPT Lead)
+ *    - Added health Endpoint
  */
 
 require("dotenv").config();
@@ -140,8 +142,8 @@ app.use("/api/v1/me", me);
 app.use("/api/onboarding", onboardingRouter);
 console.log("Onboarding routes mounted at /api/onboarding");
 
-// Health check
-app.get("/api/health", async (req, res) => {
+// DB health check (deeper diagnostic)
+app.get("/api/v1/health/db", async (req, res) => {
   try {
     const client = await pool.connect();
     await client.query("SELECT 1");
@@ -151,6 +153,19 @@ app.get("/api/health", async (req, res) => {
     console.error("Health check failed:", err.stack);
     res.status(500).json({ status: "unhealthy", dbConnected: false, error: err.message });
   }
+});
+
+// ----------------------------------------------------------------------------
+// Health Endpoint - Added 01-12-2026
+// ----------------------------------------------------------------------------
+
+// Health check (Render / monitoring)
+app.get('/api/v1/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    service: 'aquorix-backend',
+    timestamp: new Date().toISOString()
+  });
 });
 
 // DB info
