@@ -57,6 +57,138 @@ app.options("*", cors(corsOptions));
 
 app.use(express.json()); // Parse JSON requests, like PHP's json_decode
 
+// -----------------------------------------------------------------------------
+// /api/v1/me (Routing Authority)
+// Frontend contract:
+//   GET /api/v1/me with Authorization: Bearer <Supabase JWT>
+// Returns:
+//   200 { ok:true, routing_hint, onboarding:{is_complete}, ... } for existing users
+//   404 if user is not yet present in aquorix.users (new user -> onboarding)
+//   401 if token missing/invalid
+//
+// NOTE (Recovery Mode):
+//   We decode JWT payload to extract `sub` (Supabase user id).
+//   Signature verification can be added later as a hardening step.
+// -----------------------------------------------------------------------------
+
+function base64UrlDecode(str) {
+  const base64 = str.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
+  return Buffer.from(padded, 'base64').toString('utf8');
+}
+
+function getSupabaseUserIdFromBearer(req) {
+  const auth = req.headers.authorization || '';
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return null;
+
+  const token = m[1].trim();
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+
+  try {
+    const payloadJson = base64UrlDecode(parts[1]);
+    const payload = JSON.parse(payloadJson);
+    if (!payload || !payload.sub) return null;
+    return String(payload.sub);
+  } catch (e) {
+    return null;
+  }
+}
+
+app.get('/api/v1/me', async (req, res) => {
+  const supabase_user_id = getSupabaseUserIdFromBearer(req);
+
+  if (!supabase_user_id) {
+    return res.status(401).json({ ok: false, error: 'Missing or invalid Bearer token' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+
+    const result = await client.query(
+      `
+      SELECT
+        u.user_id,
+        u.supabase_user_id,
+        u.email,
+        u.role,
+        u.tier,
+        u.is_active,
+        p.first_name,
+        p.last_name,
+        p.tier_level,
+        p.onboarding_metadata,
+        p.onboarding_completed_at
+      FROM aquorix.users u
+      LEFT JOIN aquorix.pro_profiles p ON u.user_id = p.user_id
+      WHERE u.supabase_user_id = $1
+      LIMIT 1
+      `,
+      [supabase_user_id]
+    );
+
+    if (result.rows.length === 0) {
+      // Contract: user not yet present in AQUORIX DB (new user -> onboarding)
+      return res.status(404).json({ ok: false, error: 'User not found' });
+    }
+
+    const row = result.rows[0];
+
+    // Compute onboarding completion (best-effort)
+    const onboardingMeta = row.onboarding_metadata || {};
+    const completionPctRaw = onboardingMeta.completion_percentage;
+    const completionPct = Number.isFinite(Number(completionPctRaw)) ? Number(completionPctRaw) : null;
+
+    const isComplete =
+      Boolean(row.onboarding_completed_at) ||
+      (completionPct !== null && completionPct >= 100) ||
+      onboardingMeta.is_complete === true;
+
+    // Routing authority (CONSERVATIVE):
+    // If user exists in aquorix.users, default to dashboard.
+    // Only route to onboarding when we explicitly know it's incomplete.
+    let routing_hint = isComplete ? 'dashboard' : 'dashboard';
+
+    // Optional admin routing (keep minimal & cautious)
+    const role = String(row.role || '').toLowerCase();
+    if (role === 'admin') {
+      routing_hint = 'admin';
+    } else if (!isComplete && (onboardingMeta && onboardingMeta.current_step != null)) {
+      // If we have explicit onboarding state, we can route to onboarding.
+      // This prevents accidentally sending established users to onboarding due to missing metadata.
+      routing_hint = 'onboarding';
+    }
+
+    return res.json({
+      ok: true,
+      routing_hint,
+      user: {
+        supabase_user_id: row.supabase_user_id,
+        email: row.email,
+        role: row.role,
+        tier: row.tier,
+        is_active: row.is_active
+      },
+      profile: {
+        first_name: row.first_name,
+        last_name: row.last_name,
+        tier_level: row.tier_level
+      },
+      onboarding: {
+        is_complete: isComplete,
+        metadata: onboardingMeta
+      }
+    });
+  } catch (err) {
+    console.error('[api/v1/me] Error:', err && err.stack ? err.stack : err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
 // Database connection pool: Connects to Supabase PostgreSQL, like PHP's PDO
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL, // Supabase transaction pooler, e.g., postgresql://postgres.spltrqrscqmtrfknvycj:3xpl0r3th3D3pths2025@aws-0-us-west-1.pooler.supabase.com:6543/postgres
