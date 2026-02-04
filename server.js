@@ -1,7 +1,7 @@
 /*
  * AQUORIX Pro Backend Server
  * Description: Express server for AQUORIX Pro Dashboard, providing health check and Supabase PostgreSQL connectivity
- * Version: 1.0.6
+ * Version: 1.0.7
  * Author: Larrym
  * Date: 2025-09-19
  * Change Log:
@@ -15,6 +15,7 @@
  *   - 2025-07-03: Added error handling to /api/health endpoint (v1.0.5)
  *   - 2025-07-03: Added onboarding router for /api/onboarding endpoint
  *   - 2025-09-19: Fixed middleware order - CORS and express.json now load before routes, removed duplicate middleware (v1.0.6)
+ *   - 2026-02-04: v1.0.7 - Replace entire CORS Block for live version (onrender vs. localhost:3000)
  */
 
 const express = require('express'); // Express: Like PHP's Laravel for routing HTTP requests
@@ -27,13 +28,32 @@ const port = process.env.PORT || 3001; // Port: Uses env variable or defaults to
 
 // MIDDLEWARE SETUP - Must come before route registration
 
-// Allow frontend requests
-app.use(cors({
-  origin: 'http://localhost:3500',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
-}));
+// Allow frontend requests (Render + local dev)
+const ALLOWED_ORIGINS = new Set([
+  "https://aquorix-frontend.onrender.com",
+  "https://aquorix-frontend-dev.onrender.com",
+  "http://localhost:3000",
+]);
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow requests with no Origin (curl, Postman, server-to-server, mobile apps)
+    if (!origin) return callback(null, true);
+
+    if (ALLOWED_ORIGINS.has(origin)) return callback(null, true);
+
+    // Deny anything else
+    return callback(null, false);
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
 
 app.use(express.json()); // Parse JSON requests, like PHP's json_decode
 
