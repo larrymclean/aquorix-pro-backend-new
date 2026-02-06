@@ -1,7 +1,7 @@
 /*
  * AQUORIX Pro Backend Server
  * Description: Express server for AQUORIX Pro Dashboard, providing health check and Supabase PostgreSQL connectivity
- * Version: 1.0.7
+ * Version: 1.0.8
  * Author: Larrym
  * Date: 2025-09-19
  * Change Log:
@@ -16,6 +16,7 @@
  *   - 2025-07-03: Added onboarding router for /api/onboarding endpoint
  *   - 2025-09-19: Fixed middleware order - CORS and express.json now load before routes, removed duplicate middleware (v1.0.6)
  *   - 2026-02-04: v1.0.7 - Replace entire CORS Block for live version (onrender vs. localhost:3000)
+ *   - 2026-02-06: v1.0.8 - Add ui_mode + permissions to the existing JSON response
  */
 
 const express = require('express'); // Express: Like PHP's Laravel for routing HTTP requests
@@ -161,9 +162,62 @@ app.get('/api/v1/me', async (req, res) => {
       routing_hint = 'onboarding';
     }
 
+        // --- UI MODE + PERMISSIONS (Dashboard gating contract) ---
+    // Frontend nav is permission-gated (see src/config/navigation.ts in frontend).
+    // If permissions is missing/empty, nav collapses to "Bookings only".
+    const tier = String(row.tier || '').toLowerCase();
+    const tierLevel = Number(row.tier_level) || 1;
+
+    let ui_mode = 'pro';
+    if (role === 'admin') {
+      ui_mode = 'admin';
+    } else if (tier === 'affiliate' || tierLevel >= 5) {
+      ui_mode = 'affiliate';
+    } else {
+      ui_mode = 'pro';
+    }
+
+    // Only use permission keys that exist in frontend navigation.ts union:
+    // can_use_admin_tools, can_use_operator_tools, can_use_affiliate_tools,
+    // can_view_schedule, can_edit_profile, can_manage_operator, can_edit, can_approve, can_modify_config
+    let permissions = {
+      can_use_admin_tools: false,
+      can_use_operator_tools: false,
+      can_use_affiliate_tools: false,
+      can_view_schedule: false,
+      can_edit_profile: false,
+      can_manage_operator: false,
+      can_edit: false,
+      can_approve: false,
+      can_modify_config: false
+    };
+
+    if (ui_mode === 'admin') {
+      permissions = {
+        ...permissions,
+        can_use_admin_tools: true,
+        can_modify_config: true
+      };
+    } else if (ui_mode === 'affiliate') {
+      permissions = {
+        ...permissions,
+        can_use_affiliate_tools: true
+      };
+    } else {
+      // pro (tiers 1–4)
+      permissions = {
+        ...permissions,
+        can_use_operator_tools: true,
+        can_view_schedule: true,
+        can_edit_profile: true
+      };
+    }
+
     return res.json({
       ok: true,
       routing_hint,
+      ui_mode,
+      permissions,
       user: {
         supabase_user_id: row.supabase_user_id,
         email: row.email,
