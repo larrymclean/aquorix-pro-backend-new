@@ -1,9 +1,9 @@
 /*
  * AQUORIX Pro Backend Server
  * Description: Express server for AQUORIX Pro Dashboard, providing health check and Supabase PostgreSQL connectivity
- * Version: 1.0.8
+ * Version: 1.1.0
  * Author: Larrym
- * Date: 2025-09-19
+ * Date: 2026-02-12
  * Change Log:
  *   - 2025-07-01: Initial setup with /api/health endpoint (v1.0.0)
  *   - 2025-07-01: Added CORS middleware for http://localhost:3004
@@ -17,6 +17,10 @@
  *   - 2025-09-19: Fixed middleware order - CORS and express.json now load before routes, removed duplicate middleware (v1.0.6)
  *   - 2026-02-04: v1.0.7 - Replace entire CORS Block for live version (onrender vs. localhost:3000)
  *   - 2026-02-06: v1.0.8 - Add ui_mode + permissions to the existing JSON response
+ *   - 2026-02-07: v1.0.9 - Allow localhost:3500 for local dev CORS
+ *   - 2026-02-12: v1.1.0 - Add Public Schedule Widget endpoint (read-only)
+ *   - 2026-02-12: v1.1.0 - Add Cache-Control header (public, max-age=300) for widget responses
+ *   - 2026-02-12: v1.1.0 - Cleanup: remove accidental terminal artifact '%' from file
  */
 
 const express = require('express'); // Express: Like PHP's Laravel for routing HTTP requests
@@ -34,6 +38,7 @@ const ALLOWED_ORIGINS = new Set([
   "https://aquorix-frontend.onrender.com",
   "https://aquorix-frontend-dev.onrender.com",
   "http://localhost:3000",
+  "http://localhost:3500",
 ]);
 
 const corsOptions = {
@@ -436,6 +441,149 @@ app.get('/api/alerts', async (req, res) => {
   } catch (err) {
     console.error('Error fetching alerts:', err.stack);
     res.status(500).json({ error: 'Failed to fetch alerts' });
+  }
+});
+
+/**
+ * =========================================================
+ * AQUORIX — Public Schedule Widget (Read-Only)
+ * Route: GET /api/v1/public/widgets/schedule/:operator_slug
+ * Purpose: Return a simple week schedule for an operator (public widget)
+ *
+ * NON-NEGOTIABLE ARCH:
+ * - Supabase = Auth ONLY
+ * - aquorix PostgreSQL schema = ALL business data
+ *
+ * Version: 1.0.0
+ * Date: 2026-02-12
+ * =========================================================
+ */
+app.get("/api/v1/public/widgets/schedule/:operator_slug", async (req, res) => {
+  const { operator_slug } = req.params;
+  const weekStartParam = (req.query.week_start || "").toString().trim();
+
+  const isValidYMD = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+
+  try {
+    // 1) Resolve operator by slug
+    const opResult = await pool.query(
+      `
+      SELECT operator_id, operator_slug, name, timezone, default_currency
+      FROM aquorix.diveoperators
+      WHERE operator_slug = $1
+      LIMIT 1
+      `,
+      [operator_slug]
+    );
+
+    if (opResult.rowCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        status: "not_found",
+        message: `Operator not found: ${operator_slug}`,
+      });
+    }
+
+    const operator = opResult.rows[0];
+    const tz = operator.timezone || "UTC";
+
+    // 2) Determine week_start + week_end in operator local time
+    const weekStartSql = isValidYMD(weekStartParam) ? weekStartParam : null;
+
+    const weekRange = await pool.query(
+      `
+      WITH base AS (
+        SELECT
+          CASE
+            WHEN $1::text IS NOT NULL THEN $1::date
+            ELSE (
+              (date_trunc('day', now() AT TIME ZONE $2)::date)
+              - ((EXTRACT(ISODOW FROM (now() AT TIME ZONE $2))::int) - 1)
+            )
+          END AS week_start
+      )
+      SELECT
+        week_start::text AS week_start,
+        (week_start + interval '6 days')::date::text AS week_end
+      FROM base
+      `,
+      [weekStartSql, tz]
+    );
+
+    const week_start = weekRange.rows[0].week_start;
+    const week_end = weekRange.rows[0].week_end;
+
+    // 3) Pull sessions for that operator during that week (display in operator timezone)
+    const sessions = await pool.query(
+      `
+      SELECT
+        ds.session_id,
+        (ds.dive_datetime AT TIME ZONE $4)::date::text AS session_date,
+        EXTRACT(ISODOW FROM (ds.dive_datetime AT TIME ZONE $4))::int AS day_of_week,
+        to_char((ds.dive_datetime AT TIME ZONE $4)::time, 'HH24:MI') AS start_time,
+        dsite.name AS site_name
+      FROM aquorix.dive_sessions ds
+      JOIN aquorix.divesites dsite ON dsite.dive_site_id = ds.dive_site_id
+      WHERE ds.operator_id = $1
+        AND (ds.dive_datetime AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date
+      ORDER BY session_date ASC, start_time ASC
+      `,
+      [operator.operator_id, week_start, week_end, tz]
+    );
+
+    const weekdayNames = {
+      1: "Monday",
+      2: "Tuesday",
+      3: "Wednesday",
+      4: "Thursday",
+      5: "Friday",
+      6: "Saturday",
+      7: "Sunday",
+    };
+
+    const byDate = new Map();
+
+    for (const row of sessions.rows) {
+      if (!byDate.has(row.session_date)) {
+        byDate.set(row.session_date, {
+          date: row.session_date,
+          weekday: weekdayNames[row.day_of_week],
+          sessions: [],
+        });
+      }
+
+      byDate.get(row.session_date).sessions.push({
+        session_id: row.session_id,
+        start_time: row.start_time,
+        site_name: row.site_name,
+
+        // honest MVP (capacity not modeled yet in dive_sessions)
+        capacity_total: null,
+        capacity_remaining: null,
+      });
+    }
+
+    res.set("Cache-Control", "public, max-age=300");
+
+    return res.json({
+      ok: true,
+      status: "success",
+      operator: {
+        slug: operator.operator_slug,
+        name: operator.name,
+        timezone: tz,
+        currency: operator.default_currency,
+      },
+      week: { start: week_start, end: week_end },
+      days: Array.from(byDate.values()),
+    });
+  } catch (err) {
+    console.error("Public Schedule Widget Error:", err);
+    return res.status(500).json({
+      ok: false,
+      status: "error",
+      message: "Internal server error",
+    });
   }
 });
 
