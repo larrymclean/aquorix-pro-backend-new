@@ -564,6 +564,7 @@ app.get("/api/v1/public/widgets/schedule/:operator_slug", async (req, res) => {
       JOIN aquorix.divesites dsite ON dsite.dive_site_id = ds.dive_site_id
       WHERE ds.operator_id = $1
         AND (ds.dive_datetime AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date
+        AND ds.cancelled_at IS NULL
       ORDER BY session_date ASC, start_time ASC
       `,
       [operator.operator_id, week_start, week_end, tz]
