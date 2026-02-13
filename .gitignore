@@ -8,3 +8,8 @@ node_modules/
 
 *.bak.*
 *.bak
+
+# --- AQUORIX: allow DB migrations to be committed ---
+!db/
+!db/migrations/
+!db/migrations/*.sql
