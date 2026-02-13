@@ -460,9 +460,46 @@ app.get('/api/alerts', async (req, res) => {
  */
 app.get("/api/v1/public/widgets/schedule/:operator_slug", async (req, res) => {
   const { operator_slug } = req.params;
-  const weekStartParam = (req.query.week_start || "").toString().trim();
 
-  const isValidYMD = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+  // VIKING v1.3.1 (LOCKED):
+  // - week_start is OPTIONAL (if omitted → default to operator-local current week start)
+  // - if week_start is PRESENT but invalid OR present-but-empty → 400 (predictable + cache-safe)
+  const rawWeekStart = req.query.week_start;
+
+  // Strict YYYY-MM-DD + real calendar date check (rejects 2026-13-01, 2026-02-30, etc.)
+  function isValidWeekStartYMD(value) {
+    const s = String(value).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+
+    const [yyyy, mm, dd] = s.split("-").map((n) => parseInt(n, 10));
+    if (!yyyy || !mm || !dd) return false;
+
+    // Use UTC to avoid timezone surprises
+    const d = new Date(Date.UTC(yyyy, mm - 1, dd));
+    return (
+      d.getUTCFullYear() === yyyy &&
+      d.getUTCMonth() === mm - 1 &&
+      d.getUTCDate() === dd
+    );
+  }
+
+  // If parameter is present but empty => reject
+  if (rawWeekStart !== undefined) {
+    const trimmed = String(rawWeekStart).trim();
+
+    if (trimmed.length === 0 || !isValidWeekStartYMD(trimmed)) {
+      return res.status(400).json({
+        ok: false,
+        status: "bad_request",
+        message: "Invalid week_start format. Use YYYY-MM-DD (e.g., 2026-02-09)",
+      });
+    }
+  }
+
+  // If omitted => null (backend computes operator-local current week start)
+  // If present => validated YYYY-MM-DD string
+  const weekStartParam = rawWeekStart === undefined ? null : String(rawWeekStart).trim();
+
 
   try {
     // 1) Resolve operator by slug
@@ -488,7 +525,8 @@ app.get("/api/v1/public/widgets/schedule/:operator_slug", async (req, res) => {
     const tz = operator.timezone || "UTC";
 
     // 2) Determine week_start + week_end in operator local time
-    const weekStartSql = isValidYMD(weekStartParam) ? weekStartParam : null;
+    const weekStartSql = weekStartParam; // already validated above, or null if omitted
+
 
     const weekRange = await pool.query(
       `
