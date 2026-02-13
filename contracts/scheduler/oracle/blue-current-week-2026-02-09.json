@@ -1,0 +1,104 @@
+{
+  "days": [
+    {
+      "date": "2026-02-10",
+      "sessions": [
+        {
+          "capacity_remaining": null,
+          "capacity_total": null,
+          "session_id": "15",
+          "site_name": "Power Station",
+          "start_time": "08:30"
+        },
+        {
+          "capacity_remaining": null,
+          "capacity_total": null,
+          "session_id": "16",
+          "site_name": "Japanese Gardens",
+          "start_time": "11:30"
+        },
+        {
+          "capacity_remaining": null,
+          "capacity_total": null,
+          "session_id": "17",
+          "site_name": "Seven Sisters",
+          "start_time": "14:00"
+        }
+      ],
+      "weekday": "Tuesday"
+    },
+    {
+      "date": "2026-02-11",
+      "sessions": [
+        {
+          "capacity_remaining": null,
+          "capacity_total": null,
+          "session_id": "18",
+          "site_name": "Cedar Pride",
+          "start_time": "09:00"
+        },
+        {
+          "capacity_remaining": null,
+          "capacity_total": null,
+          "session_id": "19",
+          "site_name": "Tristar",
+          "start_time": "11:30"
+        },
+        {
+          "capacity_remaining": null,
+          "capacity_total": null,
+          "session_id": "20",
+          "site_name": "First Bay North",
+          "start_time": "14:00"
+        }
+      ],
+      "weekday": "Wednesday"
+    },
+    {
+      "date": "2026-02-12",
+      "sessions": [
+        {
+          "capacity_remaining": null,
+          "capacity_total": null,
+          "session_id": "21",
+          "site_name": "C-130",
+          "start_time": "09:00"
+        },
+        {
+          "capacity_remaining": null,
+          "capacity_total": null,
+          "session_id": "22",
+          "site_name": "Black Rock",
+          "start_time": "11:30"
+        },
+        {
+          "capacity_remaining": null,
+          "capacity_total": null,
+          "session_id": "23",
+          "site_name": "Rainbow Reef",
+          "start_time": "14:00"
+        },
+        {
+          "capacity_remaining": null,
+          "capacity_total": null,
+          "session_id": "24",
+          "site_name": "Eel Garden",
+          "start_time": "16:00"
+        }
+      ],
+      "weekday": "Thursday"
+    }
+  ],
+  "ok": true,
+  "operator": {
+    "currency": "JOD",
+    "name": "Blue Current Diving",
+    "slug": "blue-current-diving",
+    "timezone": "Asia/Amman"
+  },
+  "status": "success",
+  "week": {
+    "end": "2026-02-15",
+    "start": "2026-02-09"
+  }
+}

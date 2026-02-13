@@ -1,0 +1,120 @@
+cat > /Users/larrymclean/CascadeProjects/aquorix-backend/src/scheduler/transformScheduleRows.js <<'EOF'
+/*
+  Product: AQUORIX Scheduler App v1
+  File: transformScheduleRows.js
+  Path: /Users/larrymclean/CascadeProjects/aquorix-backend/src/scheduler/transformScheduleRows.js
+  Description:
+    Pure transform module: DB session rows → public schedule widget JSON contract.
+    This isolates core scheduling IP for strict parity testing (M3 ship-blocking gate).
+
+  Author: Larry McLean + ChatGPT (Lead Technical Architect)
+  Created: 2026-02-13
+  Version: 1.0.0
+
+  Last Updated: 2026-02-13
+  Status: ACTIVE (Scheduler App v1)
+
+  Change Log:
+    - 2026-02-13 - v1.0.0 (Larry + ChatGPT):
+      - Initial extraction of schedule transform logic into pure module
+      - Deterministic ordering (days by date asc, sessions by start_time asc)
+      - Contract shape matches public widget response
+*/
+
+function weekdayNameFromIsoDow(isoDow) {
+  const map = {
+    1: "Monday",
+    2: "Tuesday",
+    3: "Wednesday",
+    4: "Thursday",
+    5: "Friday",
+    6: "Saturday",
+    7: "Sunday",
+  };
+  return map[Number(isoDow)] || null;
+}
+
+/**
+ * Transform raw DB rows into the public schedule widget JSON contract.
+ *
+ * Expected row shape (from DB query):
+ *   {
+ *     session_id: number,
+ *     session_date: "YYYY-MM-DD",
+ *     day_of_week: 1..7 (ISO DOW),
+ *     start_time: "HH:MM",
+ *     site_name: string
+ *   }
+ *
+ * @param {Array<Object>} rows
+ * @param {Object} operator
+ * @param {Object} week
+ * @returns {Object} schedule widget payload
+ */
+function transformScheduleRows(rows, operator, week) {
+  if (!Array.isArray(rows)) {
+    throw new Error("transformScheduleRows: rows must be an array");
+  }
+  if (!operator || typeof operator !== "object") {
+    throw new Error("transformScheduleRows: operator must be an object");
+  }
+  if (!week || typeof week !== "object") {
+    throw new Error("transformScheduleRows: week must be an object");
+  }
+
+  // Deterministic grouping by date (Map preserves insertion order, but we will sort keys explicitly)
+  const byDate = new Map();
+
+  for (const row of rows) {
+    const date = String(row.session_date || "").trim();
+    if (!date) continue;
+
+    if (!byDate.has(date)) {
+      byDate.set(date, {
+        date,
+        weekday: weekdayNameFromIsoDow(row.day_of_week),
+        sessions: [],
+      });
+    }
+
+    byDate.get(date).sessions.push({
+      session_id: row.session_id,
+      start_time: row.start_time,
+      site_name: row.site_name,
+
+      // honest MVP (capacity not modeled yet in dive_sessions)
+      capacity_total: null,
+      capacity_remaining: null,
+    });
+  }
+
+  // Sort days ascending by date
+  const dayKeys = Array.from(byDate.keys()).sort((a, b) => a.localeCompare(b));
+
+  // Sort sessions within each day
+  const days = dayKeys.map((date) => {
+    const day = byDate.get(date);
+    day.sessions.sort((a, b) => String(a.start_time).localeCompare(String(b.start_time)));
+    return day;
+  });
+
+  return {
+    ok: true,
+    status: "success",
+    operator: {
+      slug: operator.operator_slug,
+      name: operator.name,
+      timezone: operator.timezone || "UTC",
+      currency: operator.default_currency,
+    },
+    week: {
+      start: week.start,
+      end: week.end,
+    },
+    days,
+  };
+}
+
+module.exports = {
+  transformScheduleRows,
+};

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ------------------------------------------------------------
-# AQUORIX — VIKING
+# AQUORIX — VIKINGSCHEDULER API V1.0
 # Phase 3.2: Contract Drift Guard (Public Schedule Widget)
 #
 # Verifies:
