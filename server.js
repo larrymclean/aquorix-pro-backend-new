@@ -274,6 +274,40 @@ app.get('/api/v1/me', async (req, res) => {
 
     const row = result.rows[0];
 
+        // -----------------------------------------------------------------
+    // PHASE 6: Operator Context Resolution
+    // -----------------------------------------------------------------
+
+    // 1) Fetch active affiliations for this user
+    const affResult = await client.query(
+      `
+      SELECT
+        uoa.operator_id,
+        uoa.affiliation_type,
+        d.name,
+        d.operator_slug
+      FROM aquorix.user_operator_affiliations uoa
+      JOIN aquorix.diveoperators d
+        ON d.operator_id = uoa.operator_id
+      WHERE uoa.user_id = $1
+        AND uoa.active = true
+      ORDER BY uoa.updated_at DESC, uoa.created_at DESC
+      `,
+      [row.user_id]
+    );
+
+    const affiliations = affResult.rows.map(a => ({
+      operator_id: a.operator_id,
+      name: a.name,
+      slug: a.operator_slug,
+      role: a.affiliation_type
+    }));
+
+    const affiliation_count = affiliations.length;
+
+    // 2) Determine active operator id (nullable)
+    const active_operator_id = row.active_operator_id || null;
+
     const onboardingMeta = row.onboarding_metadata || {};
     const completionPctRaw = onboardingMeta.completion_percentage;
     const completionPct = Number.isFinite(Number(completionPctRaw)) ? Number(completionPctRaw) : null;
@@ -344,8 +378,18 @@ app.get('/api/v1/me', async (req, res) => {
       onboarding: {
         is_complete: isComplete,
         metadata: onboardingMeta
+      },
+
+      // -----------------------------
+      // NEW: Operator Context
+      // -----------------------------
+      operator_context: {
+        affiliation_count,
+        active_operator_id,
+        affiliations
       }
     });
+
   } catch (err) {
     console.error('[api/v1/me] Error:', err && err.stack ? err.stack : err);
     return res.status(500).json({ ok: false, error: 'Internal server error' });
