@@ -1,35 +1,27 @@
 /*
  * AQUORIX Pro Backend Server
- * File: server.js
- * Path: /Users/larrymclean/CascadeProjects/aquorix-backend/server.js
- * Description: Express server for AQUORIX Pro Dashboard + Public Widgets
- *
- * Author: Larry McLean
- * Created: 2025-07-01
- * Version: 1.2.1
- *
- * Last Updated: 2026-02-14
- * Status: ACTIVE (Local-first Dev / Phase 4)
- *
- * Change Log (append-only):
- *   - 2025-07-01: v1.0.0 - Initial setup with /api/health endpoint
- *   - 2025-07-01: v1.0.0 - Added CORS middleware for http://localhost:3004
- *   - 2025-07-01: v1.0.0 - Added .gitignore to exclude node_modules
- *   - 2025-07-02: v1.0.1 - Added PostgreSQL connection pool (pg) (local/dev)
- *   - 2025-07-03: v1.0.2 - Added GET /api/users endpoint for CRUD operations
- *   - 2025-07-03: v1.0.3 - Added POST /api/sensors endpoint for CRUD operations
- *   - 2025-07-03: v1.0.4 - Added GET /api/alerts endpoint for CRUD operations
- *   - 2025-07-03: v1.0.5 - Added error handling to /api/health endpoint
- *   - 2025-07-03: v1.0.5 - Added onboarding router for /api/onboarding endpoint
- *   - 2025-09-19: v1.0.6 - Fixed middleware order; removed duplicate middleware
- *   - 2026-02-04: v1.0.7 - Replace entire CORS block for live vs localhost
+ * Description: Express server for AQUORIX Pro Dashboard, providing health check and Supabase PostgreSQL connectivity
+ * Version: 1.2.0
+ * Author: Larrym
+ * Date: 2026-02-12
+ * Change Log:
+ *   - 2025-07-01: Initial setup with /api/health endpoint (v1.0.0)
+ *   - 2025-07-01: Added CORS middleware for http://localhost:3004
+ *   - 2025-07-01: Added .gitignore to exclude node_modules
+ *   - 2025-07-02: Added Supabase PostgreSQL connection pool with transaction mode (v1.0.1)
+ *   - 2025-07-03: Added GET /api/users endpoint for CRUD operations (v1.0.2)
+ *   - 2025-07-03: Added POST /api/sensors endpoint for CRUD operations (v1.0.3)
+ *   - 2025-07-03: Added GET /api/alerts endpoint for CRUD operations (v1.0.4)
+ *   - 2025-07-03: Added error handling to /api/health endpoint (v1.0.5)
+ *   - 2025-07-03: Added onboarding router for /api/onboarding endpoint
+ *   - 2025-09-19: Fixed middleware order - CORS and express.json now load before routes, removed duplicate middleware (v1.0.6)
+ *   - 2026-02-04: v1.0.7 - Replace entire CORS Block for live version (onrender vs. localhost:3000)
  *   - 2026-02-06: v1.0.8 - Add ui_mode + permissions to the existing JSON response
  *   - 2026-02-07: v1.0.9 - Allow localhost:3500 for local dev CORS
  *   - 2026-02-12: v1.1.0 - Add Public Schedule Widget endpoint (read-only)
  *   - 2026-02-12: v1.1.0 - Add Cache-Control header (public, max-age=300) for widget responses
  *   - 2026-02-12: v1.1.0 - Cleanup: remove accidental terminal artifact '%' from file
  *   - 2026-02-14: v1.2.0 - M4: Dashboard scheduling endpoints (scoped CRUD + cancel); auth-derived operator scope; widget excludes cancelled sessions
- *   - 2026-02-14: v1.2.1 - Add DB fingerprint log at startup; enforce multi-affiliation 409; enhance dashboard schedule payload w/ itineraries + teams + vessels joins
  */
 
 const express = require('express');
@@ -69,10 +61,6 @@ app.use(express.json());
 
 // -----------------------------------------------------------------------------
 // Database connection pool
-// NOTE:
-// - Local-first dev: ssl=false
-// - When running on Render production, you may need ssl enabled depending on Render config.
-//   We keep local-first deterministic here.
 // -----------------------------------------------------------------------------
 
 const pool = new Pool({
@@ -80,38 +68,13 @@ const pool = new Pool({
   ssl: false
 });
 
-async function logDbFingerprint() {
-  try {
-    const result = await pool.query(`
-      SELECT
-        current_database() AS db_name,
-        inet_server_addr() AS server_ip,
-        inet_server_port() AS server_port,
-        current_setting('server_version_num') AS server_version_num,
-        current_user AS db_user
-    `);
-
-    const fp = result.rows && result.rows[0] ? result.rows[0] : null;
-
-    console.log("------------------------------------------------------------");
-    console.log("[AQUORIX DB FINGERPRINT]");
-    console.log(fp);
-    console.log("------------------------------------------------------------");
-  } catch (err) {
-    console.error("[AQUORIX DB FINGERPRINT] FAILED:", err && err.stack ? err.stack : err);
-  }
-}
-
-pool.connect(async (err, client, release) => {
+pool.connect((err, client, release) => {
   if (err) {
     console.error('Error connecting to database:', err.stack);
     return;
   }
   console.log('Connected to PostgreSQL database');
   release();
-
-  // fingerprint log (startup)
-  await logDbFingerprint();
 });
 
 // -----------------------------------------------------------------------------
@@ -147,7 +110,6 @@ function getSupabaseUserIdFromBearer(req) {
 // Dashboard Auth + Operator Scope Middleware (PHASE 4 RULE A)
 // - Derive operator_id from: users.supabase_user_id -> users.user_id -> user_operator_affiliations(active=true)
 // - Never accept operator_id from request body/query params.
-// - If >1 active affiliations: return 409 (operator selection required).
 // -----------------------------------------------------------------------------
 
 async function requireDashboardScope(req, res, next) {
@@ -179,32 +141,24 @@ async function requireDashboardScope(req, res, next) {
       return res.status(403).json({ ok: false, status: "forbidden", message: "User is inactive" });
     }
 
-    // 2) Resolve operator affiliations (active=true)
-    const affAll = await pool.query(
+    // 2) Resolve operator affiliation (active=true)
+    const affResult = await pool.query(
       `
-      SELECT operator_id, affiliation_type, updated_at, created_at, affiliation_id
+      SELECT operator_id, affiliation_type
       FROM aquorix.user_operator_affiliations
       WHERE user_id = $1
         AND active = true
       ORDER BY updated_at DESC, created_at DESC, affiliation_id DESC
+      LIMIT 1
       `,
       [user.user_id]
     );
 
-    if (affAll.rowCount === 0) {
+    if (affResult.rowCount === 0) {
       return res.status(403).json({
         ok: false,
         status: "forbidden",
         message: "User has no active operator affiliation"
-      });
-    }
-
-    if (affAll.rowCount > 1) {
-      return res.status(409).json({
-        ok: false,
-        status: "conflict",
-        message: "User has multiple active operator affiliations; operator selection required",
-        affiliation_count: affAll.rowCount
       });
     }
 
@@ -215,7 +169,7 @@ async function requireDashboardScope(req, res, next) {
       tier: user.tier
     };
 
-    req.operator_id = affAll.rows[0].operator_id;
+    req.operator_id = affResult.rows[0].operator_id;
 
     return next();
   } catch (err) {
@@ -604,7 +558,6 @@ app.get("/api/v1/public/widgets/schedule/:operator_slug", async (req, res) => {
 
 // -----------------------------------------------------------------------------
 // DASHBOARD SCHEDULING (M4) - Scoped CRUD + Cancel
-// NOTE: This endpoint now returns itinerary/team/vessel context for UI rendering.
 // -----------------------------------------------------------------------------
 
 app.get("/api/v1/dashboard/schedule", requireDashboardScope, async (req, res) => {
@@ -629,6 +582,7 @@ app.get("/api/v1/dashboard/schedule", requireDashboardScope, async (req, res) =>
   const weekStartParam = rawWeekStart === undefined ? null : String(rawWeekStart).trim();
 
   try {
+    // operator timezone
     const op = await pool.query(
       `SELECT operator_id, timezone FROM aquorix.diveoperators WHERE operator_id = $1 LIMIT 1`,
       [req.operator_id]
@@ -667,37 +621,16 @@ app.get("/api/v1/dashboard/schedule", requireDashboardScope, async (req, res) =>
       `
       SELECT
         ds.session_id,
-
-        -- itinerary context (requested focus)
-        ds.itinerary_id,
-        it.title AS itinerary_title,
-        it.itinerary_date::text AS itinerary_date,
-        it.dive_slot::text AS itinerary_slot,
-        it.location_type::text AS itinerary_location_type,
-        it.itinerary_type::text AS itinerary_type,
-
-        -- team context
-        ds.team_id,
-        dt.team_name,
-
-        -- vessel context (optional)
-        ds.vessel_id,
-        v.name AS vessel_name,
-        v.max_capacity AS vessel_max_capacity,
-
-        -- site + session details
         ds.dive_site_id,
         dsite.name AS site_name,
         (ds.dive_datetime AT TIME ZONE $4)::date::text AS session_date,
         to_char((ds.dive_datetime AT TIME ZONE $4)::time, 'HH24:MI') AS start_time,
         to_char((ds.meet_time AT TIME ZONE $4)::time, 'HH24:MI') AS meet_time,
         ds.session_type,
-        ds.notes
+        ds.notes,
+        ds.cancelled_at
       FROM aquorix.dive_sessions ds
       JOIN aquorix.divesites dsite ON dsite.dive_site_id = ds.dive_site_id
-      JOIN aquorix.itineraries it ON it.itinerary_id = ds.itinerary_id
-      JOIN aquorix.dive_teams dt ON dt.team_id = ds.team_id
-      LEFT JOIN aquorix.vessels v ON v.vessel_id = ds.vessel_id
       WHERE ds.operator_id = $1
         AND (ds.dive_datetime AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date
         AND ds.cancelled_at IS NULL
@@ -720,36 +653,28 @@ app.get("/api/v1/dashboard/schedule", requireDashboardScope, async (req, res) =>
 });
 
 app.post("/api/v1/dashboard/schedule/sessions", requireDashboardScope, async (req, res) => {
-  const { dive_site_id, dive_datetime, meet_time, notes, session_type, itinerary_id, team_id, vessel_id } = req.body || {};
+  const { dive_site_id, dive_datetime, meet_time, notes, session_type } = req.body || {};
 
-  // NOTE: your schema requires itinerary_id + team_id + dive_site_id + dive_datetime
-  if (!itinerary_id || !team_id || !dive_site_id || !dive_datetime) {
-    return res.status(400).json({
-      ok: false,
-      status: "bad_request",
-      message: "itinerary_id, team_id, dive_site_id, and dive_datetime are required"
-    });
+  if (!dive_site_id || !dive_datetime) {
+    return res.status(400).json({ ok: false, status: "bad_request", message: "dive_site_id and dive_datetime are required" });
   }
 
   try {
     const result = await pool.query(
       `
       INSERT INTO aquorix.dive_sessions
-        (operator_id, itinerary_id, team_id, dive_site_id, dive_datetime, meet_time, notes, session_type, vessel_id, updated_at)
+        (operator_id, dive_site_id, dive_datetime, meet_time, notes, session_type, updated_at)
       VALUES
-        ($1, $2, $3, $4, $5::timestamptz, $6::timestamptz, $7, $8, $9, now())
+        ($1, $2, $3::timestamptz, $4::timestamptz, $5, $6, now())
       RETURNING session_id
       `,
       [
         req.operator_id,
-        itinerary_id,
-        team_id,
         dive_site_id,
         dive_datetime,
         meet_time || null,
         notes || null,
-        session_type || null,
-        vessel_id || null
+        session_type || null
       ]
     );
 
@@ -763,13 +688,13 @@ app.post("/api/v1/dashboard/schedule/sessions", requireDashboardScope, async (re
 app.patch("/api/v1/dashboard/schedule/sessions/:session_id", requireDashboardScope, async (req, res) => {
   const { session_id } = req.params;
 
+  // Phase 4 allowed edits: time + site + notes (+ meet_time)
   const allowed = {
     dive_site_id: req.body?.dive_site_id,
     dive_datetime: req.body?.dive_datetime,
     meet_time: req.body?.meet_time,
     notes: req.body?.notes,
-    session_type: req.body?.session_type,
-    vessel_id: req.body?.vessel_id
+    session_type: req.body?.session_type
   };
 
   const setParts = [];
@@ -787,8 +712,10 @@ app.patch("/api/v1/dashboard/schedule/sessions/:session_id", requireDashboardSco
     return res.status(400).json({ ok: false, status: "bad_request", message: "No editable fields provided" });
   }
 
+  // always update updated_at
   setParts.push(`updated_at = now()`);
 
+  // WHERE binds
   values.push(session_id);
   const sessionIdParam = `$${idx}`;
   idx++;
@@ -846,25 +773,6 @@ app.post("/api/v1/dashboard/schedule/sessions/:session_id/cancel", requireDashbo
   } catch (err) {
     console.error("[dashboard cancel session] Error:", err);
     return res.status(500).json({ ok: false, status: "error", message: "Internal server error" });
-  }
-});
-
-// -----------------------------------------------------------------------------
-// DEBUG: DB Fingerprint (LOCAL DEV ONLY)
-// -----------------------------------------------------------------------------
-app.get('/api/v1/debug/db-fingerprint', async (req, res) => {
-  try {
-    const r = await pool.query(`
-      SELECT
-        current_database() AS db_name,
-        inet_server_addr() AS server_ip,
-        inet_server_port() AS server_port,
-        current_setting('server_version_num') AS server_version_num,
-        current_user AS db_user
-    `);
-    return res.json({ ok: true, fingerprint: r.rows[0] });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
