@@ -6,7 +6,7 @@
  *
  * Author: Larry McLean
  * Created: 2025-07-01
- * Version: 1.2.1
+ * Version: 1.2.2
  *
  * Last Updated: 2026-02-14
  * Status: ACTIVE (Local-first Dev / Phase 4)
@@ -30,6 +30,7 @@
  *   - 2026-02-12: v1.1.0 - Cleanup: remove accidental terminal artifact '%' from file
  *   - 2026-02-14: v1.2.0 - M4: Dashboard scheduling endpoints (scoped CRUD + cancel); auth-derived operator scope; widget excludes cancelled sessions
  *   - 2026-02-14: v1.2.1 - Add DB fingerprint log at startup; enforce multi-affiliation 409; enhance dashboard schedule payload w/ itineraries + teams + vessels joins
+ *   - 2026-02-16: v1.2.2 - Phase 6: Add operator selection endpoint; requireDashboardScope honors users.active_operator_id for multi-affiliation users
  */
 
 const express = require('express');
@@ -144,6 +145,54 @@ function getSupabaseUserIdFromBearer(req) {
 }
 
 // -----------------------------------------------------------------------------
+// Phase 6: Lightweight Auth Middleware (NO operator scope)
+// - Validates Bearer token format
+// - Resolves AQUORIX user (users table)
+// - Attaches req.aquorix_user_basic
+// -----------------------------------------------------------------------------
+async function requireAuthUser(req, res, next) {
+  const supabase_user_id = getSupabaseUserIdFromBearer(req);
+
+  if (!supabase_user_id) {
+    return res.status(401).json({ ok: false, status: "unauthorized", message: "Missing or invalid Bearer token" });
+  }
+
+  try {
+    const userResult = await pool.query(
+      `
+      SELECT user_id, role, tier, is_active
+      FROM aquorix.users
+      WHERE supabase_user_id = $1
+      LIMIT 1
+      `,
+      [supabase_user_id]
+    );
+
+    if (userResult.rowCount === 0) {
+      return res.status(404).json({ ok: false, status: "not_found", message: "User not found in AQUORIX DB" });
+    }
+
+    const user = userResult.rows[0];
+
+    if (user.is_active === false) {
+      return res.status(403).json({ ok: false, status: "forbidden", message: "User is inactive" });
+    }
+
+    req.aquorix_user_basic = {
+      supabase_user_id,
+      user_id: user.user_id,
+      role: user.role,
+      tier: user.tier
+    };
+
+    return next();
+  } catch (err) {
+    console.error("[requireAuthUser] Error:", err && err.stack ? err.stack : err);
+    return res.status(500).json({ ok: false, status: "error", message: "Internal server error" });
+  }
+}
+
+// -----------------------------------------------------------------------------
 // Dashboard Auth + Operator Scope Middleware (PHASE 4 RULE A)
 // - Derive operator_id from: users.supabase_user_id -> users.user_id -> user_operator_affiliations(active=true)
 // - Never accept operator_id from request body/query params.
@@ -161,7 +210,7 @@ async function requireDashboardScope(req, res, next) {
     // 1) Resolve AQUORIX user
     const userResult = await pool.query(
       `
-      SELECT user_id, role, tier, is_active
+      SELECT user_id, role, tier, is_active, active_operator_id
       FROM aquorix.users
       WHERE supabase_user_id = $1
       LIMIT 1
@@ -200,13 +249,32 @@ async function requireDashboardScope(req, res, next) {
     }
 
     if (affAll.rowCount > 1) {
-      return res.status(409).json({
-        ok: false,
-        status: "conflict",
-        message: "User has multiple active operator affiliations; operator selection required",
-        affiliation_count: affAll.rowCount
-      });
+  const activeOp = user.active_operator_id;
+
+  // If user already selected an active operator and it is still affiliated, use it.
+  if (activeOp) {
+    const match = affAll.rows.find(a => String(a.operator_id) === String(activeOp));
+      if (match) {
+        req.aquorix_user = {
+          supabase_user_id,
+          user_id: user.user_id,
+          role: user.role,
+          tier: user.tier
+        };
+        req.operator_id = match.operator_id;
+        return next();
+      }
     }
+
+    // Otherwise force selection
+    return res.status(409).json({
+      ok: false,
+      status: "conflict",
+      message: "User has multiple active operator affiliations; operator selection required",
+      affiliation_count: affAll.rowCount,
+      active_operator_id: activeOp ? String(activeOp) : null
+    });
+  }
 
     req.aquorix_user = {
       supabase_user_id,
@@ -255,6 +323,7 @@ app.get('/api/v1/me', async (req, res) => {
         u.role,
         u.tier,
         u.is_active,
+        u.active_operator_id,
         p.first_name,
         p.last_name,
         p.tier_level,
@@ -395,6 +464,72 @@ app.get('/api/v1/me', async (req, res) => {
     return res.status(500).json({ ok: false, error: 'Internal server error' });
   } finally {
     if (client) client.release();
+  }
+});
+
+
+// -----------------------------------------------------------------------------
+// Phase 6: Set Active Operator (multi-affiliation operator selection)
+// POST /api/v1/operator/active
+// Body: { "operator_id": 145 }
+// Rules:
+// - Caller must be an authenticated AQUORIX user (requireAuthUser)
+// - operator_id must be one of the caller's ACTIVE affiliations
+// - Sets aquorix.users.active_operator_id
+// -----------------------------------------------------------------------------
+app.post("/api/v1/operator/active", requireAuthUser, async (req, res) => {
+  const operator_id_raw = req.body?.operator_id;
+
+  const operator_id = Number(operator_id_raw);
+  if (!Number.isFinite(operator_id) || operator_id <= 0) {
+    return res.status(400).json({
+      ok: false,
+      status: "bad_request",
+      message: "operator_id must be a positive number"
+    });
+  }
+
+  try {
+    // Confirm the operator is one of this user's active affiliations
+    const aff = await pool.query(
+      `
+      SELECT 1
+      FROM aquorix.user_operator_affiliations
+      WHERE user_id = $1
+        AND operator_id = $2
+        AND active = true
+      LIMIT 1
+      `,
+      [req.aquorix_user_basic.user_id, operator_id]
+    );
+
+    if (aff.rowCount === 0) {
+      return res.status(403).json({
+        ok: false,
+        status: "forbidden",
+        message: "operator_id is not an active affiliation for this user"
+      });
+    }
+
+    // Set active operator
+    await pool.query(
+      `
+      UPDATE aquorix.users
+      SET active_operator_id = $2,
+          updated_at = now()
+      WHERE user_id = $1
+      `,
+      [req.aquorix_user_basic.user_id, operator_id]
+    );
+
+    return res.json({
+      ok: true,
+      status: "success",
+      active_operator_id: String(operator_id)
+    });
+  } catch (err) {
+    console.error("[POST /api/v1/operator/active] Error:", err && err.stack ? err.stack : err);
+    return res.status(500).json({ ok: false, status: "error", message: "Internal server error" });
   }
 });
 
