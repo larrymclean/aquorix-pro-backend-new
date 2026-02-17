@@ -248,6 +248,31 @@ async function requireDashboardScope(req, res, next) {
       });
     }
 
+    // -----------------------------------------------------------------
+    // PHASE 6: Auto-set active_operator_id when exactly ONE affiliation
+    // -----------------------------------------------------------------
+    if (!user.active_operator_id && affAll.rowCount === 1) {
+      const onlyOperatorId = affAll.rows[0].operator_id;
+
+      try {
+        await pool.query(
+          `
+          UPDATE aquorix.users
+          SET active_operator_id = $1,
+              updated_at = now()
+          WHERE user_id = $2
+          `,
+          [onlyOperatorId, user.user_id]
+        );
+
+        // Update in-memory value so this request uses it immediately
+        user.active_operator_id = onlyOperatorId;
+      } catch (e) {
+        console.error("[requireDashboardScope] Auto-set active_operator_id failed:", e);
+        // Do NOT block the request; fallback to normal behavior below
+      }
+    }
+
     if (affAll.rowCount > 1) {
   const activeOp = user.active_operator_id;
 
