@@ -6,7 +6,7 @@
  *
  * Author: Larry McLean
  * Created: 2025-07-01
- * Version: 1.2.2
+ * Version: 1.2.3
  *
  * Last Updated: 2026-02-14
  * Status: ACTIVE (Local-first Dev / Phase 4)
@@ -31,6 +31,7 @@
  *   - 2026-02-14: v1.2.0 - M4: Dashboard scheduling endpoints (scoped CRUD + cancel); auth-derived operator scope; widget excludes cancelled sessions
  *   - 2026-02-14: v1.2.1 - Add DB fingerprint log at startup; enforce multi-affiliation 409; enhance dashboard schedule payload w/ itineraries + teams + vessels joins
  *   - 2026-02-16: v1.2.2 - Phase 6: Add operator selection endpoint; requireDashboardScope honors users.active_operator_id for multi-affiliation users
+ *   - 2026-02-17: v1.2.3 - Phase 6: Phase 6 hardening
  */
 
 const express = require('express');
@@ -812,6 +813,11 @@ app.get("/api/v1/public/widgets/schedule/:operator_slug", async (req, res) => {
 // -----------------------------------------------------------------------------
 
 app.get("/api/v1/dashboard/schedule", requireDashboardScope, async (req, res) => {
+  // Phase 6 hardening: never cache operator-scoped dashboard schedule
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+
   const rawWeekStart = req.query.week_start;
 
   function isValidWeekStartYMD(value) {
