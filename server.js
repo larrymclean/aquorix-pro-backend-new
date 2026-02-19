@@ -6,9 +6,9 @@
  *
  * Author: Larry McLean
  * Created: 2025-07-01
- * Version: 1.2.3
+ * Version: 1.2.7
  *
- * Last Updated: 2026-02-14
+ * Last Updated: 2026-02-18
  * Status: ACTIVE (Local-first Dev / Phase 4)
  *
  * Change Log (append-only):
@@ -32,12 +32,24 @@
  *   - 2026-02-14: v1.2.1 - Add DB fingerprint log at startup; enforce multi-affiliation 409; enhance dashboard schedule payload w/ itineraries + teams + vessels joins
  *   - 2026-02-16: v1.2.2 - Phase 6: Add operator selection endpoint; requireDashboardScope honors users.active_operator_id for multi-affiliation users
  *   - 2026-02-17: v1.2.3 - Phase 6: Phase 6 hardening
+ *   - 2026-02-18: v1.2.4 - Phase 7: POST /api/v1/bookings/request (pending) + best-effort notifications (email + WhatsApp) logged to aquorix.notifications
+ *   - 2026-02-18: v1.2.5 - Phase 7: GET /api/v1/dashboard/bookings (scoped, week_start aware, pending-first sort)
+ *  - 2026-02-18: v1.2.6 - Phase 7: Dashboard operator capacity GET/PATCH endpoints + operator capacity helper
+ *  - 2026-02-19: v1.2.7 - Phase 7: Add HOLD to booking request (minimal, safe, immediate value)
  */
+
+const HOLD_WINDOW_MINUTES = Number(process.env.HOLD_WINDOW_MINUTES || 10);
 
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 require('dotenv').config();
+
+// -----------------------------------------------------------------------------
+// Phase 7 (Viking): Notifications + DB Notification Store
+// -----------------------------------------------------------------------------
+const notifications = require("./src/services/notifications");
+const notificationStore = require("./src/services/notificationStore");
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -319,6 +331,64 @@ async function requireDashboardScope(req, res, next) {
 }
 
 // -----------------------------------------------------------------------------
+// Phase 7: Operator Capacity (Viking Configurable)
+// - Stored in aquorix.diveoperators.operator_default_capacity
+// - Fallback: env VIKING_OPERATOR_DEFAULT_CAPACITY (default 20)
+// -----------------------------------------------------------------------------
+async function getOperatorDefaultCapacity(operator_id) {
+  const fallbackRaw = process.env.VIKING_OPERATOR_DEFAULT_CAPACITY;
+  const fallback = Number.isFinite(Number(fallbackRaw)) ? Number(fallbackRaw) : 20;
+
+  try {
+    const r = await pool.query(
+      `
+      SELECT operator_default_capacity
+      FROM aquorix.diveoperators
+      WHERE operator_id = $1
+      LIMIT 1
+      `,
+      [operator_id]
+    );
+
+    if (r.rowCount === 0) return fallback;
+
+    const v = r.rows[0].operator_default_capacity;
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return n;
+
+    return fallback;
+  } catch (e) {
+    console.error("[getOperatorDefaultCapacity] failed; using fallback:", e);
+    return fallback;
+  }
+}
+
+async function getCapacityConsumedForSession(clientOrPool, operator_id, session_id) {
+  const r = await clientOrPool.query(
+    `
+    SELECT
+      COALESCE(SUM(
+        CASE
+          WHEN booking_status = 'confirmed' THEN headcount
+          WHEN booking_status = 'pending'
+            AND payment_status = 'unpaid'
+            AND hold_expires_at IS NOT NULL
+            AND hold_expires_at > now()
+          THEN headcount
+          ELSE 0
+        END
+      ), 0) AS capacity_consumed
+    FROM aquorix.dive_bookings
+    WHERE operator_id = $1
+      AND session_id = $2
+    `,
+    [operator_id, session_id]
+  );
+
+  return Number(r.rows[0].capacity_consumed || 0);
+}
+
+// -----------------------------------------------------------------------------
 // ROUTE REGISTRATION - After middleware setup
 // -----------------------------------------------------------------------------
 
@@ -560,6 +630,540 @@ app.post("/api/v1/operator/active", requireAuthUser, async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
+// PHASE 7 (VIKING): BOOKINGS - Request (Public / Widget / Internal Test)
+// POST /api/v1/bookings/request
+//
+// Rules:
+// - Never accept operator_id from client. Derive from dive_sessions.
+// - Insert booking first (MUST succeed even if notifications fail).
+// - Notifications are best-effort and ALWAYS logged to aquorix.notifications.
+// - booking_status uses enum values: confirmed | pending | cancelled
+// -----------------------------------------------------------------------------
+app.post("/api/v1/bookings/request", async (req, res) => {
+  const {
+    session_id,
+    guest_name,
+    guest_email,
+    guest_phone,
+    headcount,
+    special_requests,
+    source
+  } = req.body || {};
+
+  // 1) Validate required fields (matches your CHECK constraint)
+  const sidNum = Number(session_id);
+  if (!Number.isFinite(sidNum) || sidNum <= 0) {
+    return res.status(400).json({ ok: false, status: "bad_request", message: "session_id must be a positive number" });
+  }
+
+  if (!guest_name || String(guest_name).trim().length === 0) {
+    return res.status(400).json({ ok: false, status: "bad_request", message: "guest_name is required" });
+  }
+
+  if (!guest_email || String(guest_email).trim().length === 0) {
+    return res.status(400).json({ ok: false, status: "bad_request", message: "guest_email is required" });
+  }
+
+  const guest_email_normalized = String(guest_email).trim().toLowerCase();
+
+  const hc = headcount === undefined || headcount === null ? 1 : Number(headcount);
+  if (!Number.isFinite(hc) || hc <= 0) {
+    return res.status(400).json({ ok: false, status: "bad_request", message: "headcount must be a positive number" });
+  }
+
+  // Source defaults to 'website' to match your table default convention
+  const src = (source && String(source).trim().length > 0) ? String(source).trim() : "website";
+
+  let operator_id = null;
+  let itinerary_id = null;
+  let dive_datetime = null;
+
+  try {
+    // 2) Resolve session → derive operator_id + itinerary_id
+    const s = await pool.query(
+      `
+      SELECT session_id, operator_id, itinerary_id, dive_datetime
+      FROM aquorix.dive_sessions
+      WHERE session_id = $1 AND cancelled_at IS NULL
+      LIMIT 1
+      `,
+      [sidNum]
+    );
+
+    if (s.rowCount === 0) {
+      return res.status(404).json({ ok: false, status: "not_found", message: "Session not found (or cancelled)" });
+    }
+
+    operator_id = s.rows[0].operator_id;
+    itinerary_id = s.rows[0].itinerary_id;
+    dive_datetime = s.rows[0].dive_datetime;
+
+    // 3) Insert booking (MUST succeed even if notifications fail)
+    const b = await pool.query(
+      `
+      INSERT INTO aquorix.dive_bookings
+        (itinerary_id, operator_id, booking_status, session_id, headcount, guest_name, guest_email, guest_phone, special_requests, source, hold_expires_at, created_at, updated_at)
+      VALUES
+        ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, now() + ($10::int * interval '1 minute'), now(), now())
+      RETURNING booking_id
+      `,
+      [
+        itinerary_id,
+        operator_id,
+        sidNum,
+        hc,
+        String(guest_name).trim(),
+        guest_email_normalized,
+        guest_phone ? String(guest_phone).trim() : null,
+        special_requests ? String(special_requests).trim() : null,
+        src,
+        HOLD_WINDOW_MINUTES
+      ]
+    );
+
+    const booking_id = b.rows[0].booking_id;
+
+    // 4) Best-effort notifications (DO NOT block response)
+    // WhatsApp (operator)
+    (async () => {
+      const waBody =
+        `NEW BOOKING REQUEST\n\n` +
+        `${String(guest_name).trim()}\n` +
+        `Party of ${hc}\n` +
+        `Session ID: ${sidNum}\n\n` +
+        `Approve in AQUORIX dashboard`;
+
+      try {
+        const waResp = await notifications.sendOperatorWhatsApp({ body: waBody });
+
+        await notificationStore.logSent(pool, {
+          recipient_type: "operator",
+          recipient_email: waResp.to || process.env.VIKING_TEST_WHATSAPP_TO || "whatsapp:unknown",
+          event_type: "booking_request.operator.whatsapp",
+          subject: null,
+          body: waBody,
+          booking_id,
+          session_id: sidNum,
+          operator_id
+        });
+        } catch (e) {
+        try {
+          await notificationStore.logFailed(pool, {
+            recipient_type: "operator",
+            recipient_email: process.env.VIKING_TEST_WHATSAPP_TO || "whatsapp:unknown",
+            event_type: "booking_request.operator.whatsapp",
+            subject: null,
+            body: waBody,
+            error_message: e && e.message ? e.message : String(e),
+            booking_id,
+            session_id: sidNum,
+            operator_id
+          });
+        } catch (logErr) {
+          console.error("[bookings/request] whatsapp notify failed AND logFailed failed:", logErr);
+        }
+      }
+
+    })();
+
+    // Email (operator)
+    (async () => {
+      const subject = `New Booking Request - ${String(guest_name).trim()} (${hc})`;
+      const html = `
+        <h2>New Booking Request</h2>
+        <p><b>Guest:</b> ${String(guest_name).trim()}</p>
+        <p><b>Headcount:</b> ${hc}</p>
+        <p><b>Session ID:</b> ${sidNum}</p>
+        ${dive_datetime ? `<p><b>Dive Time:</b> ${String(dive_datetime)}</p>` : ``}
+        ${guest_phone ? `<p><b>Phone:</b> ${String(guest_phone).trim()}</p>` : ``}
+        <p><b>Email:</b> ${String(guest_email).trim()}</p>
+        ${special_requests ? `<p><b>Special Requests:</b><br/>${String(special_requests).trim()}</p>` : ``}
+        <hr/>
+        <p>Review in the AQUORIX dashboard.</p>
+      `;
+
+      try {
+        const emResp = await notifications.sendOperatorEmail({ subject, html });
+
+        await notificationStore.logSent(pool, {
+          recipient_type: "operator",
+          recipient_email: process.env.VIKING_OPERATOR_NOTIFICATION_EMAIL || "operator_email:unknown",
+          event_type: "booking_request.operator.email",
+          subject,
+          body: html,
+          booking_id,
+          session_id: sidNum,
+          operator_id
+        });
+            } catch (e) {
+        try {
+          await notificationStore.logFailed(pool, {
+            recipient_type: "operator",
+            recipient_email: process.env.VIKING_OPERATOR_NOTIFICATION_EMAIL || "operator_email:unknown",
+            event_type: "booking_request.operator.email",
+            subject,
+            body: html,
+            error_message: e && e.message ? e.message : String(e),
+            booking_id,
+            session_id: sidNum,
+            operator_id
+          });
+        } catch (logErr) {
+          console.error("[bookings/request] email notify failed AND logFailed failed:", logErr);
+        }
+      }
+
+    })();
+
+    // 5) Respond immediately (do NOT wait for notifications)
+    return res.status(201).json({
+      ok: true,
+      status: "created",
+      booking_id: String(booking_id),
+      booking_status: "pending"
+    });
+
+  } catch (err) {
+    console.error("[POST /api/v1/bookings/request] Error:", err && err.stack ? err.stack : err);
+    return res.status(500).json({ ok: false, status: "error", message: "Internal server error" });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// PHASE 7 (VIKING): DASHBOARD BOOKINGS LIST (Scoped to active operator)
+// GET /api/v1/dashboard/bookings?week_start=YYYY-MM-DD
+//
+// Rules:
+// - requireDashboardScope enforces operator_id (no bleed)
+// - week_start validation identical to schedule endpoints
+// - stable sort: pending first, then dive_datetime, then created_at
+// -----------------------------------------------------------------------------
+app.get("/api/v1/dashboard/bookings", requireDashboardScope, async (req, res) => {
+  // Never cache operator-scoped bookings
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+
+  const rawWeekStart = req.query.week_start;
+
+  function isValidWeekStartYMD(value) {
+    const s = String(value).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+    const [yyyy, mm, dd] = s.split("-").map((n) => parseInt(n, 10));
+    if (!yyyy || !mm || !dd) return false;
+    const d = new Date(Date.UTC(yyyy, mm - 1, dd));
+    return (d.getUTCFullYear() === yyyy && d.getUTCMonth() === mm - 1 && d.getUTCDate() === dd);
+  }
+
+  if (rawWeekStart !== undefined) {
+    const trimmed = String(rawWeekStart).trim();
+    if (trimmed.length === 0 || !isValidWeekStartYMD(trimmed)) {
+      return res.status(400).json({ ok: false, status: "bad_request", message: "Invalid week_start. Use YYYY-MM-DD." });
+    }
+  }
+
+  const weekStartParam = rawWeekStart === undefined ? null : String(rawWeekStart).trim();
+
+  try {
+    // Resolve operator timezone (same approach as schedule)
+    const op = await pool.query(
+      `SELECT operator_id, timezone FROM aquorix.diveoperators WHERE operator_id = $1 LIMIT 1`,
+      [req.operator_id]
+    );
+
+    if (op.rowCount === 0) {
+      return res.status(403).json({ ok: false, status: "forbidden", message: "Operator not found for user scope" });
+    }
+
+    const tz = op.rows[0].timezone || "UTC";
+
+    // Compute week range in operator timezone
+    const weekRange = await pool.query(
+      `
+      WITH base AS (
+        SELECT
+          CASE
+            WHEN $1::text IS NOT NULL THEN $1::date
+            ELSE (
+              (date_trunc('day', now() AT TIME ZONE $2)::date)
+              - ((EXTRACT(ISODOW FROM (now() AT TIME ZONE $2))::int) - 1)
+            )
+          END AS week_start
+      )
+      SELECT
+        week_start::text AS week_start,
+        (week_start + interval '6 days')::date::text AS week_end
+      FROM base
+      `,
+      [weekStartParam, tz]
+    );
+
+    const week_start = weekRange.rows[0].week_start;
+    const week_end = weekRange.rows[0].week_end;
+
+    // Bookings joined to sessions/sites/itineraries for UI context
+    const r = await pool.query(
+      `
+      SELECT
+        b.booking_id,
+        b.booking_status::text AS booking_status,
+        b.payment_status::text AS payment_status,
+        b.headcount,
+        b.guest_name,
+        b.guest_email,
+        b.guest_phone,
+        b.special_requests,
+        b.source,
+        b.created_at,
+        b.updated_at,
+
+        s.session_id,
+        s.itinerary_id,
+        (s.dive_datetime AT TIME ZONE $4) AS dive_datetime_local,
+        to_char((s.dive_datetime AT TIME ZONE $4)::date, 'YYYY-MM-DD') AS session_date,
+        to_char((s.dive_datetime AT TIME ZONE $4)::time, 'HH24:MI') AS start_time,
+
+        dsite.name AS site_name,
+
+        it.title AS itinerary_title,
+        it.itinerary_date::text AS itinerary_date,
+        it.dive_slot::text AS itinerary_slot,
+        it.itinerary_type::text AS itinerary_type,
+        it.location_type::text AS itinerary_location_type
+
+      FROM aquorix.dive_bookings b
+      JOIN aquorix.dive_sessions s ON s.session_id = b.session_id
+      JOIN aquorix.divesites dsite ON dsite.dive_site_id = s.dive_site_id
+      JOIN aquorix.itineraries it ON it.itinerary_id = s.itinerary_id
+      WHERE b.operator_id = $1
+        AND b.session_id IS NOT NULL
+        AND s.cancelled_at IS NULL
+        AND (s.dive_datetime AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date
+      ORDER BY
+        CASE WHEN b.booking_status::text = 'pending' THEN 0 ELSE 1 END ASC,
+        (s.dive_datetime AT TIME ZONE $4) ASC,
+        b.created_at ASC
+      `,
+      [req.operator_id, week_start, week_end, tz]
+    );
+
+    return res.json({
+      ok: true,
+      status: "success",
+      operator_id: String(req.operator_id),
+      week: { start: week_start, end: week_end },
+      bookings: r.rows
+    });
+  } catch (err) {
+    console.error("[GET /api/v1/dashboard/bookings] Error:", err && err.stack ? err.stack : err);
+    return res.status(500).json({ ok: false, status: "error", message: "Internal server error" });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Phase 7: Approve Booking (idempotent + capacity check)
+// POST /api/v1/dashboard/bookings/:booking_id/approve
+// -----------------------------------------------------------------------------
+app.post("/api/v1/dashboard/bookings/:booking_id/approve", requireDashboardScope, async (req, res) => {
+  const booking_id = Number(req.params.booking_id);
+  if (!Number.isFinite(booking_id) || booking_id <= 0) {
+    return res.status(400).json({ ok: false, status: "bad_request", message: "Invalid booking_id" });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const b = await client.query(
+      `
+      SELECT booking_id, booking_status, operator_id, session_id, headcount, guest_email, guest_name
+      FROM aquorix.dive_bookings
+      WHERE booking_id = $1
+        AND operator_id = $2
+      FOR UPDATE
+      `,
+      [booking_id, req.operator_id]
+    );
+
+    if (b.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, status: "not_found", message: "Booking not found" });
+    }
+
+    const booking = b.rows[0];
+
+    // Idempotency
+    if (booking.booking_status === "confirmed") {
+      await client.query("ROLLBACK");
+      return res.json({ ok: true, status: "success", action: "noop_already_confirmed", booking_id: String(booking_id) });
+    }
+    if (booking.booking_status === "cancelled") {
+      await client.query("ROLLBACK");
+      return res.json({ ok: true, status: "success", action: "noop_already_cancelled", booking_id: String(booking_id) });
+    }
+
+    // Capacity check (confirmed only)
+    const capacity = await getOperatorDefaultCapacity(req.operator_id);
+
+    const sum = await client.query(
+      `
+      SELECT COALESCE(SUM(headcount), 0) AS confirmed_headcount
+      FROM aquorix.dive_bookings
+      WHERE operator_id = $1
+        AND session_id = $2
+        AND booking_status = 'confirmed'
+      `,
+      [req.operator_id, booking.session_id]
+    );
+
+    const confirmed_headcount = Number(sum.rows[0].confirmed_headcount || 0);
+    const requested = Number(booking.headcount || 1);
+
+    if (confirmed_headcount + requested > capacity) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        ok: false,
+        status: "conflict",
+        message: "Over capacity for this session",
+        capacity,
+        confirmed_headcount,
+        requested_headcount: requested
+      });
+    }
+
+    await client.query("COMMIT");
+
+    // NOTE (Viking doctrine): Payment reserves the seat.
+    // Operator "approval" is exception-only and does NOT confirm/reserve inventory.
+    // This endpoint is retained for manual workflows (e.g., special cases / extra boat).
+    return res.json({
+      ok: true,
+      status: "success",
+      action: "approved_for_manual_handling",
+      booking_id: String(booking_id)
+    });
+
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("[approve booking] error:", e);
+    return res.status(500).json({ ok: false, status: "error", message: "Internal server error" });
+  } finally {
+    client.release();
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Phase 7: Reject Booking (idempotent)
+// POST /api/v1/dashboard/bookings/:booking_id/reject
+// -----------------------------------------------------------------------------
+app.post("/api/v1/dashboard/bookings/:booking_id/reject", requireDashboardScope, async (req, res) => {
+  const booking_id = Number(req.params.booking_id);
+  if (!Number.isFinite(booking_id) || booking_id <= 0) {
+    return res.status(400).json({ ok: false, status: "bad_request", message: "Invalid booking_id" });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const b = await client.query(
+      `
+      SELECT booking_id, booking_status, operator_id, session_id, guest_email, guest_name
+      FROM aquorix.dive_bookings
+      WHERE booking_id = $1
+        AND operator_id = $2
+      FOR UPDATE
+      `,
+      [booking_id, req.operator_id]
+    );
+
+    if (b.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, status: "not_found", message: "Booking not found" });
+    }
+
+    const booking = b.rows[0];
+
+    // Idempotency
+    if (booking.booking_status === "cancelled") {
+      await client.query("ROLLBACK");
+      return res.json({ ok: true, status: "success", action: "noop_already_cancelled", booking_id: String(booking_id) });
+    }
+    if (booking.booking_status === "confirmed") {
+      // Still allow cancellation via reject for MVP moderation behavior
+      // (You can split “cancel confirmed” into a separate endpoint later)
+    }
+
+    await client.query(
+      `
+      UPDATE aquorix.dive_bookings
+      SET booking_status = 'cancelled',
+          updated_at = now()
+      WHERE booking_id = $1
+        AND operator_id = $2
+      `,
+      [booking_id, req.operator_id]
+    );
+
+    await client.query("COMMIT");
+
+        // Best-effort guest notification (EMAIL) + ALWAYS logged
+    (async () => {
+      if (!booking.guest_email) return;
+
+      const subject = "AQUORIX Booking Update";
+      const html = `<h2>Booking Update</h2><p>Hello ${booking.guest_name || "Guest"}, your booking request was not approved.</p>`;
+
+      try {
+        await notifications.sendGuestEmail({
+          to: booking.guest_email,
+          subject,
+          html
+        });
+
+        await notificationStore.logSent(pool, {
+          recipient_type: "guest",
+          recipient_email: String(booking.guest_email).trim(),
+          event_type: "booking_rejected.guest.email",
+          subject,
+          body: html,
+          booking_id,
+          session_id: booking.session_id,
+          operator_id: req.operator_id
+        });
+      } catch (e) {
+        try {
+          await notificationStore.logFailed(pool, {
+            recipient_type: "guest",
+            recipient_email: String(booking.guest_email).trim(),
+            event_type: "booking_rejected.guest.email",
+            subject,
+            body: html,
+            error_message: e && e.message ? e.message : String(e),
+            booking_id,
+            session_id: booking.session_id,
+            operator_id: req.operator_id
+          });
+        } catch (logErr) {
+          console.error("[reject booking] guest notify failed AND logFailed failed:", logErr);
+        }
+      }
+    })();
+
+    return res.json({ ok: true, status: "success", action: "rejected", booking_id: String(booking_id) });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("[reject booking] error:", e);
+    return res.status(500).json({ ok: false, status: "error", message: "Internal server error" });
+  } finally {
+    client.release();
+  }
+});
+
+
+// -----------------------------------------------------------------------------
 // Health check
 // -----------------------------------------------------------------------------
 
@@ -582,7 +1186,7 @@ app.get('/api/health', async (req, res) => {
 app.get('/api/users', async (req, res) => {
   try {
     const client = await pool.connect();
-    const result = await client.query('SELECT user_id, email, role, tier, created_at FROM users');
+    const result = await client.query('SELECT user_id, email, role, tier, created_at FROM aquorix.users');
     client.release();
     res.json(result.rows);
   } catch (err) {
@@ -803,6 +1407,90 @@ app.get("/api/v1/public/widgets/schedule/:operator_slug", async (req, res) => {
     });
   } catch (err) {
     console.error("Public Schedule Widget Error:", err);
+    return res.status(500).json({ ok: false, status: "error", message: "Internal server error" });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// DASHBOARD: OPERATOR CAPACITY (Phase 7 - Viking)
+// - Read/write operator_default_capacity (dashboard configurable)
+// - Scoped by requireDashboardScope (never accept operator_id from client)
+// -----------------------------------------------------------------------------
+
+app.get("/api/v1/dashboard/operator/capacity", requireDashboardScope, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `
+      SELECT operator_id, operator_default_capacity
+      FROM aquorix.diveoperators
+      WHERE operator_id = $1
+      LIMIT 1
+      `,
+      [req.operator_id]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        status: "not_found",
+        message: "Operator not found for scoped user"
+      });
+    }
+
+    const row = r.rows[0];
+
+    return res.json({
+      ok: true,
+      status: "success",
+      operator_id: String(row.operator_id),
+      operator_default_capacity: row.operator_default_capacity == null ? null : Number(row.operator_default_capacity)
+    });
+  } catch (err) {
+    console.error("[GET /api/v1/dashboard/operator/capacity] Error:", err && err.stack ? err.stack : err);
+    return res.status(500).json({ ok: false, status: "error", message: "Internal server error" });
+  }
+});
+
+app.patch("/api/v1/dashboard/operator/capacity", requireDashboardScope, async (req, res) => {
+  const raw = req.body?.operator_default_capacity;
+  const n = Number(raw);
+
+  if (!Number.isFinite(n) || n <= 0 || n > 200) {
+    return res.status(400).json({
+      ok: false,
+      status: "bad_request",
+      message: "operator_default_capacity must be a positive number (1..200)"
+    });
+  }
+
+  try {
+    const r = await pool.query(
+      `
+      UPDATE aquorix.diveoperators
+      SET operator_default_capacity = $2,
+          updated_at = now()
+      WHERE operator_id = $1
+      RETURNING operator_id, operator_default_capacity
+      `,
+      [req.operator_id, n]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        status: "not_found",
+        message: "Operator not found for scoped user"
+      });
+    }
+
+    return res.json({
+      ok: true,
+      status: "success",
+      operator_id: String(r.rows[0].operator_id),
+      operator_default_capacity: Number(r.rows[0].operator_default_capacity)
+    });
+  } catch (err) {
+    console.error("[PATCH /api/v1/dashboard/operator/capacity] Error:", err && err.stack ? err.stack : err);
     return res.status(500).json({ ok: false, status: "error", message: "Internal server error" });
   }
 });
