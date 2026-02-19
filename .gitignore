@@ -13,3 +13,13 @@ node_modules/
 !db/
 !db/migrations/
 !db/migrations/*.sql
+
+# --- LOCAL BACKUPS / PROOFS (do not commit) ---
+.env.backup-*
+server.js.backup-*
+*_PROOF_*.txt
+_evidence_*.txt
+scripts_test_*.js
+test_twilio_whatsapp.js
+src/services/*.backup-*
+*.tgz
