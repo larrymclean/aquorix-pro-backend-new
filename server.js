@@ -38,12 +38,15 @@
  *  - 2026-02-19: v1.2.7 - Phase 7: Add HOLD to booking request (minimal, safe, immediate value)
  */
 
+require('dotenv').config();
+
 const HOLD_WINDOW_MINUTES = Number(process.env.HOLD_WINDOW_MINUTES || 10);
 
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
-require('dotenv').config();
+
+const pool = require('./src/lib/pool');
+const { getSupabaseUserIdFromBearer } = require('./src/lib/jwt');
 
 // -----------------------------------------------------------------------------
 // Phase 7 (Viking): Notifications + DB Notification Store
@@ -81,19 +84,6 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 app.use(express.json());
 
-// -----------------------------------------------------------------------------
-// Database connection pool
-// NOTE:
-// - Local-first dev: ssl=false
-// - When running on Render production, you may need ssl enabled depending on Render config.
-//   We keep local-first deterministic here.
-// -----------------------------------------------------------------------------
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: false
-});
-
 async function logDbFingerprint() {
   try {
     const result = await pool.query(`
@@ -129,42 +119,13 @@ pool.connect(async (err, client, release) => {
 });
 
 // -----------------------------------------------------------------------------
-// JWT helper (best-effort decode to extract Supabase user id)
-// -----------------------------------------------------------------------------
-
-function base64UrlDecode(str) {
-  const base64 = str.replace(/-/g, '+').replace(/_/g, '/');
-  const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
-  return Buffer.from(padded, 'base64').toString('utf8');
-}
-
-function getSupabaseUserIdFromBearer(req) {
-  const auth = req.headers.authorization || '';
-  const m = auth.match(/^Bearer\s+(.+)$/i);
-  if (!m) return null;
-
-  const token = m[1].trim();
-  const parts = token.split('.');
-  if (parts.length !== 3) return null;
-
-  try {
-    const payloadJson = base64UrlDecode(parts[1]);
-    const payload = JSON.parse(payloadJson);
-    if (!payload || !payload.sub) return null;
-    return String(payload.sub);
-  } catch (e) {
-    return null;
-  }
-}
-
-// -----------------------------------------------------------------------------
 // Phase 6: Lightweight Auth Middleware (NO operator scope)
 // - Validates Bearer token format
 // - Resolves AQUORIX user (users table)
 // - Attaches req.aquorix_user_basic
 // -----------------------------------------------------------------------------
 async function requireAuthUser(req, res, next) {
-  const supabase_user_id = getSupabaseUserIdFromBearer(req);
+  const supabase_user_id = getSupabaseUserIdFromBearer(req.headers.authorization);
 
   if (!supabase_user_id) {
     return res.status(401).json({ ok: false, status: "unauthorized", message: "Missing or invalid Bearer token" });
@@ -213,7 +174,7 @@ async function requireAuthUser(req, res, next) {
 // -----------------------------------------------------------------------------
 
 async function requireDashboardScope(req, res, next) {
-  const supabase_user_id = getSupabaseUserIdFromBearer(req);
+  const supabase_user_id = getSupabaseUserIdFromBearer(req.headers.authorization);
 
   if (!supabase_user_id) {
     return res.status(401).json({ ok: false, status: "unauthorized", message: "Missing or invalid Bearer token" });
@@ -400,7 +361,7 @@ app.use('/api/onboarding', onboardingRouter);
 // -----------------------------------------------------------------------------
 
 app.get('/api/v1/me', async (req, res) => {
-  const supabase_user_id = getSupabaseUserIdFromBearer(req);
+  const supabase_user_id = getSupabaseUserIdFromBearer(req.headers.authorization);
 
   if (!supabase_user_id) {
     return res.status(401).json({ ok: false, error: 'Missing or invalid Bearer token' });
