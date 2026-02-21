@@ -6,10 +6,10 @@
  *
  * Author: Larry McLean
  * Created: 2025-07-01
- * Version: 1.2.7
+ * Version: 1.2.8
  *
- * Last Updated: 2026-02-18
- * Status: ACTIVE (Local-first Dev / Phase 4)
+ * Last Updated: 2026-02-21
+ * Status: ACTIVE (Local-first Dev / Phase 4-8)
  *
  * Change Log (append-only):
  *   - 2025-07-01: v1.0.0 - Initial setup with /api/health endpoint
@@ -34,8 +34,12 @@
  *   - 2026-02-17: v1.2.3 - Phase 6: Phase 6 hardening
  *   - 2026-02-18: v1.2.4 - Phase 7: POST /api/v1/bookings/request (pending) + best-effort notifications (email + WhatsApp) logged to aquorix.notifications
  *   - 2026-02-18: v1.2.5 - Phase 7: GET /api/v1/dashboard/bookings (scoped, week_start aware, pending-first sort)
- *  - 2026-02-18: v1.2.6 - Phase 7: Dashboard operator capacity GET/PATCH endpoints + operator capacity helper
- *  - 2026-02-19: v1.2.7 - Phase 7: Add HOLD to booking request (minimal, safe, immediate value)
+ *   - 2026-02-18: v1.2.6 - Phase 7: Dashboard operator capacity GET/PATCH endpoints + operator capacity helper
+ *   - 2026-02-19: v1.2.7 - Phase 7: Add HOLD to booking request (minimal, safe, immediate value)
+ *   - 2026-02-20: v1.2.8 - Phase 8: Approve Booking => Stripe Checkout (payment spine) + idempotent checkout session creation
+ *   - 2026-02-21: v1.2.8 - Phase 8.1: Dual-currency policy (ledger JOD, charge USD) + FX estimate + store stripe_charge_* + fx_rate_* fields
+ *   - 2026-02-21: v1.2.8 - Phase 8.1: Fix Postgres param typing for nullable FX fields (explicit casts)
+ *  - 2026-02-21: v1.2.8 - Phase 8.1: Dual-currency Stripe Checkout (JOD ledger + USD charge) with FX estimate + minor-unit hardening (JOD=3, USD=2); store stripe_charge_* + fx_rate_* fields; approve endpoint returns ledger + charge amounts; idempotent checkout retrieval
  */
 
 require('dotenv').config();
@@ -49,6 +53,8 @@ const pool = require('./src/lib/pool');
 const { getSupabaseUserIdFromBearer } = require('./src/lib/jwt');
 const { requireAuthUserFactory } = require('./src/middleware/requireAuthUser');
 const { requireDashboardScopeFactory } = require('./src/middleware/requireDashboardScope');
+
+const { getStripeClient } = require('./src/services/stripe');
 
 // -----------------------------------------------------------------------------
 // Phase 7 (Viking): Notifications + DB Notification Store
@@ -754,8 +760,21 @@ app.get("/api/v1/dashboard/bookings", requireDashboardScope, async (req, res) =>
 });
 
 // -----------------------------------------------------------------------------
-// Phase 7: Approve Booking (idempotent + capacity check)
+// Phase 8: Approve Booking => Initiate Payment (Stripe Checkout)
 // POST /api/v1/dashboard/bookings/:booking_id/approve
+//
+// Viking Doctrine:
+// - "Approval" initiates payment and returns checkout_url.
+// - Seat is reserved ONLY when payment succeeds (webhook will confirm).
+//
+// Idempotency + Concurrency:
+// - Locks booking row FOR UPDATE.
+// - If stripe_checkout_session_id already exists, returns existing Stripe session URL.
+// - Capacity check uses getCapacityConsumedForSession (confirmed + active holds).
+//
+// Amount Authority:
+// - Server decides the amount. Client cannot inject pricing.
+// - For now: booking.payment_amount MUST be set (NUMERIC(10,2)) or approve returns 400.
 // -----------------------------------------------------------------------------
 app.post("/api/v1/dashboard/bookings/:booking_id/approve", requireDashboardScope, async (req, res) => {
   const booking_id = Number(req.params.booking_id);
@@ -763,14 +782,51 @@ app.post("/api/v1/dashboard/bookings/:booking_id/approve", requireDashboardScope
     return res.status(400).json({ ok: false, status: "bad_request", message: "Invalid booking_id" });
   }
 
+  // Env guardrails (explicit)
+  const successUrl = process.env.STRIPE_SUCCESS_URL;
+  const cancelUrl = process.env.STRIPE_CANCEL_URL;
+
+  if (!successUrl || !String(successUrl).trim()) {
+    return res.status(500).json({ ok: false, status: "error", message: "STRIPE_SUCCESS_URL missing from environment" });
+  }
+  if (!cancelUrl || !String(cancelUrl).trim()) {
+    return res.status(500).json({ ok: false, status: "error", message: "STRIPE_CANCEL_URL missing from environment" });
+  }
+
   const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
 
+    // Stripe client (lazy init so server can boot without Stripe configured)
+    let stripe;
+    try {
+      stripe = getStripeClient();
+    } catch (e) {
+      await client.query("ROLLBACK");
+      return res.status(500).json({
+        ok: false,
+        status: "error",
+        message: "Stripe is not configured on this server (missing STRIPE_SECRET_KEY)."
+      });
+    }
+
+    // 1) Lock booking row (operator scoped)
     const b = await client.query(
       `
-      SELECT booking_id, booking_status, operator_id, session_id, headcount, guest_email, guest_name
+      SELECT
+        booking_id,
+        booking_status,
+        payment_status,
+        operator_id,
+        session_id,
+        headcount,
+        guest_email,
+        guest_name,
+        payment_amount,
+        payment_currency,
+        hold_expires_at,
+        stripe_checkout_session_id
       FROM aquorix.dive_bookings
       WHERE booking_id = $1
         AND operator_id = $2
@@ -786,60 +842,299 @@ app.post("/api/v1/dashboard/bookings/:booking_id/approve", requireDashboardScope
 
     const booking = b.rows[0];
 
-    // Idempotency
-    if (booking.booking_status === "confirmed") {
-      await client.query("ROLLBACK");
-      return res.json({ ok: true, status: "success", action: "noop_already_confirmed", booking_id: String(booking_id) });
-    }
+    // 2) Terminal states / idempotency outcomes
     if (booking.booking_status === "cancelled") {
       await client.query("ROLLBACK");
       return res.json({ ok: true, status: "success", action: "noop_already_cancelled", booking_id: String(booking_id) });
     }
 
-    // Capacity check (confirmed only)
+    // If already paid+confirmed, no checkout needed
+    if (booking.payment_status === "paid" && booking.booking_status === "confirmed") {
+      await client.query("ROLLBACK");
+      return res.json({ ok: true, status: "success", action: "noop_already_paid_confirmed", booking_id: String(booking_id) });
+    }
+
+    // If we already created a checkout session before, return it (idempotent)
+    if (booking.stripe_checkout_session_id) {
+      await client.query("COMMIT");
+
+      const existingSession = await stripe.checkout.sessions.retrieve(String(booking.stripe_checkout_session_id));
+      return res.json({
+        ok: true,
+        status: "success",
+        action: "checkout_already_created",
+        booking_id: String(booking_id),
+        stripe_checkout_session_id: String(booking.stripe_checkout_session_id),
+        checkout_url: existingSession && existingSession.url ? existingSession.url : null
+      });
+    }
+
+    // 3) Must have session_id for capacity enforcement + checkout metadata integrity
+    const session_id = Number(booking.session_id);
+    if (!Number.isFinite(session_id) || session_id <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        ok: false,
+        status: "bad_request",
+        message: "Booking has no valid session_id; cannot initiate payment"
+      });
+    }
+
+    // 4) Capacity check (confirmed + active holds)
     const capacity = await getOperatorDefaultCapacity(req.operator_id);
+    const consumed = await getCapacityConsumedForSession(client, req.operator_id, session_id);
 
-    const sum = await client.query(
-      `
-      SELECT COALESCE(SUM(headcount), 0) AS confirmed_headcount
-      FROM aquorix.dive_bookings
-      WHERE operator_id = $1
-        AND session_id = $2
-        AND booking_status = 'confirmed'
-      `,
-      [req.operator_id, booking.session_id]
-    );
-
-    const confirmed_headcount = Number(sum.rows[0].confirmed_headcount || 0);
     const requested = Number(booking.headcount || 1);
+    if (!Number.isFinite(requested) || requested <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, status: "bad_request", message: "Invalid headcount on booking" });
+    }
 
-    if (confirmed_headcount + requested > capacity) {
+    if (consumed + requested > capacity) {
       await client.query("ROLLBACK");
       return res.status(409).json({
         ok: false,
         status: "conflict",
         message: "Over capacity for this session",
         capacity,
-        confirmed_headcount,
+        capacity_consumed: consumed,
         requested_headcount: requested
       });
     }
 
+    // 5) Amount authority (Phase 8 MVP rule)
+    // booking.payment_amount must be present (numeric 10,2)
+    const amt = booking.payment_amount;
+    const amountNumber = amt === null || typeof amt === "undefined" ? NaN : Number(amt);
+    if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        ok: false,
+        status: "bad_request",
+        message: "payment_amount is missing on booking; set payment_amount before initiating Stripe checkout",
+        booking_id: String(booking_id)
+      });
+    }
+
+        // -------------------------------------------------------------------------
+    // Phase 8.1 (LOCKED 2026-02-21): Dual-currency policy (Jordan)
+    // - Ledger currency = booking.payment_currency (JOD)
+    // - Charge currency = Stripe-supported platform currency (USD)
+    // - Store both truths in DB:
+    //     payment_amount_minor (ledger minor units)
+    //     stripe_charge_currency + stripe_charge_amount_minor (charge truth)
+    //     fx_rate_estimate (+ timestamp/source) when FX is involved
+    //
+    // NOTE: Stripe API expects lowercase currency codes ('usd').
+    //       DB stores uppercase currency codes ('USD', 'JOD').
+    // -------------------------------------------------------------------------
+
+    // Helper: minor unit multiplier (world-class: JOD has 3 decimals)
+    function minorUnitMultiplier(currencyUpper) {
+      switch (currencyUpper) {
+        case "JOD": return 1000; // 0.001
+        case "USD": return 100;  // 0.01
+        default: return 100;     // MVP fallback; expand later
+      }
+    }
+
+    // Ledger currency (operator truth)
+    const ledger_currency_upper = String(booking.payment_currency || "JOD").trim().toUpperCase();
+
+    // Charge currency (platform truth)
+    const isDev = String(process.env.NODE_ENV || "").trim().toLowerCase() === "development";
+    const platformChargeCurrencyLower = String(process.env.STRIPE_PLATFORM_CHARGE_CURRENCY || "usd").trim().toLowerCase();
+    const forceCurrencyLower = String(process.env.STRIPE_FORCE_CURRENCY || "").trim().toLowerCase();
+
+    const charge_currency_lower = (isDev && forceCurrencyLower) ? forceCurrencyLower : platformChargeCurrencyLower;
+    const charge_currency_upper = charge_currency_lower.toUpperCase();
+
+    // Ledger minor units (e.g., 50.00 JOD -> 50000 minor, because JOD=1000)
+    const ledger_multiplier = minorUnitMultiplier(ledger_currency_upper);
+    const ledger_amount_minor = Math.round(amountNumber * ledger_multiplier);
+
+    if (!Number.isFinite(ledger_amount_minor) || ledger_amount_minor <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        ok: false,
+        status: "bad_request",
+        message: "Invalid computed payment_amount_minor (ledger)",
+        payment_amount: String(amountNumber),
+        ledger_currency: ledger_currency_upper,
+        ledger_multiplier: String(ledger_multiplier),
+        payment_amount_minor: String(ledger_amount_minor)
+      });
+    }
+
+    // FX logic (Phase 8.1 MVP: env-based JOD->USD rate)
+    // We only require FX if ledger_currency != charge_currency
+    let fx_rate_estimate = null;
+    let fx_rate_source = null;
+
+    let charge_amount_major = amountNumber;
+
+    if (ledger_currency_upper !== charge_currency_upper) {
+      // MVP: only supporting JOD ledger -> USD charge for now
+      if (!(ledger_currency_upper === "JOD" && charge_currency_upper === "USD")) {
+        await client.query("ROLLBACK");
+        return res.status(500).json({
+          ok: false,
+          status: "error",
+          message: "Unsupported FX path for Phase 8.1 (expected JOD->USD)",
+          ledger_currency: ledger_currency_upper,
+          charge_currency: charge_currency_upper
+        });
+      }
+
+      const fxRaw = String(process.env.FX_RATE_JOD_TO_USD || "").trim();
+      const fx = fxRaw ? Number(fxRaw) : NaN;
+
+      if (!Number.isFinite(fx) || fx <= 0) {
+        await client.query("ROLLBACK");
+        return res.status(500).json({
+          ok: false,
+          status: "error",
+          message: "FX_RATE_JOD_TO_USD missing or invalid (required for JOD ledger -> USD charge)",
+          fx_raw: fxRaw
+        });
+      }
+
+      fx_rate_estimate = fx;
+      fx_rate_source = "env:FX_RATE_JOD_TO_USD";
+
+      charge_amount_major = amountNumber * fx_rate_estimate;
+    }
+
+    // Charge minor units for Stripe (USD cents)
+    const charge_multiplier = minorUnitMultiplier(charge_currency_upper);
+    const charge_amount_minor = Math.round(charge_amount_major * charge_multiplier);
+
+    if (!Number.isFinite(charge_amount_minor) || charge_amount_minor <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        ok: false,
+        status: "bad_request",
+        message: "Invalid computed Stripe charge amount minor",
+        ledger_amount: String(amountNumber),
+        ledger_currency: ledger_currency_upper,
+        fx_rate_estimate: fx_rate_estimate === null ? null : String(fx_rate_estimate),
+        charge_amount_major: String(charge_amount_major),
+        charge_currency: charge_currency_upper,
+        charge_multiplier: String(charge_multiplier),
+        charge_amount_minor: String(charge_amount_minor)
+      });
+    }
+
+    // 6) Create Stripe Checkout Session (outside DB writes, but still inside our logical flow)
+    // NOTE: We have NOT committed yet. If Stripe call fails, we roll back.
+    const checkoutSession = await stripe.checkout.sessions.create({
+      mode: "payment",
+      success_url: String(successUrl).trim(),
+      cancel_url: String(cancelUrl).trim(),
+      customer_email: booking.guest_email || undefined,
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: charge_currency_lower,         // Stripe expects lowercase (usd)
+            unit_amount: charge_amount_minor,        // Stripe minor units (cents)
+            product_data: {
+              name: "AQUORIX Dive Booking",
+              description: booking.guest_name
+                ? `Booking #${booking_id} for ${booking.guest_name} | Operator price: ${amountNumber} ${ledger_currency_upper} | Charged: ${charge_currency_upper} ${ (charge_amount_minor / charge_multiplier).toFixed(2) }`
+                : `Booking #${booking_id} | Operator price: ${amountNumber} ${ledger_currency_upper}`
+            }
+          }
+        }
+      ],
+      metadata: {
+        booking_id: String(booking_id),
+        operator_id: String(req.operator_id),
+        session_id: String(session_id),
+        headcount: String(requested),
+
+        // Dual-currency facts (for audit/debug)
+        ledger_amount: String(amountNumber),
+        ledger_currency: ledger_currency_upper,
+        ledger_amount_minor: String(ledger_amount_minor),
+        charge_currency: charge_currency_upper,
+        charge_amount_minor: String(charge_amount_minor),
+        fx_rate_estimate: fx_rate_estimate === null ? "" : String(fx_rate_estimate),
+        fx_rate_source: fx_rate_source === null ? "" : String(fx_rate_source)
+      }
+    });
+
+    if (!checkoutSession || !checkoutSession.id) {
+      throw new Error("Stripe checkout session creation failed (no session id returned)");
+    }
+
+    // 7) Persist Stripe checkout facts (idempotency anchor is UNIQUE index on stripe_checkout_session_id)
+    await client.query(
+      `
+      UPDATE aquorix.dive_bookings
+      SET
+        stripe_checkout_session_id = $1,
+
+        -- Ledger (operator truth)
+        payment_amount_minor = $2,
+
+        -- Stripe charge truth
+        stripe_charge_currency = $3,
+        stripe_charge_amount_minor = $4,
+
+        -- FX estimate (only meaningful when ledger != charge)
+        fx_rate_estimate = $5::numeric,
+        fx_rate_estimate_at = CASE WHEN $5::numeric IS NULL THEN NULL ELSE now() END,
+        fx_rate_source = $6::text,
+
+        payment_checkout_created_at = now(),
+        updated_at = now(),
+
+        -- refresh hold so customer has time to complete checkout (Phase 8 MVP policy)
+        hold_expires_at = CASE
+          WHEN hold_expires_at IS NULL OR hold_expires_at <= now()
+          THEN now() + interval '15 minutes'
+          ELSE hold_expires_at
+        END
+      WHERE booking_id = $7
+        AND operator_id = $8
+      `,
+      [
+        String(checkoutSession.id),
+        ledger_amount_minor,
+        charge_currency_upper,
+        charge_amount_minor,
+        fx_rate_estimate,
+        fx_rate_source,
+        booking_id,
+        req.operator_id
+      ]
+    );
+
     await client.query("COMMIT");
 
-    // NOTE (Viking doctrine): Payment reserves the seat.
-    // Operator "approval" is exception-only and does NOT confirm/reserve inventory.
-    // This endpoint is retained for manual workflows (e.g., special cases / extra boat).
     return res.json({
       ok: true,
       status: "success",
-      action: "approved_for_manual_handling",
-      booking_id: String(booking_id)
+      action: "checkout_created",
+      booking_id: String(booking_id),
+      stripe_checkout_session_id: String(checkoutSession.id),
+      checkout_url: checkoutSession.url || null,
+
+      // Returned for transparency/testing (Option B)
+      ledger_amount: Number(amountNumber),
+      ledger_currency: ledger_currency_upper,
+      ledger_amount_minor: Number(ledger_amount_minor),
+
+      charge_currency: charge_currency_upper,
+      charge_amount_minor: Number(charge_amount_minor),
+
+      fx_rate_estimate: fx_rate_estimate
     });
 
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch (_) {}
-    console.error("[approve booking] error:", e);
+    console.error("[approve booking => stripe checkout] error:", e && e.stack ? e.stack : e);
     return res.status(500).json({ ok: false, status: "error", message: "Internal server error" });
   } finally {
     client.release();

@@ -21,6 +21,7 @@
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.16.3",
     "resend": "^6.9.2",
+    "stripe": "^20.3.1",
     "twilio": "^5.12.1"
   },
   "devDependencies": {
