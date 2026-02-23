@@ -1,25 +1,13 @@
-node_modules/
-.env
-.DS_Store
-.vscode/
-.idea/
-*.log
-*.sql
+# -----------------------------------------------------------------------------
+# AQUORIX .gitignore (Project)
+# -----------------------------------------------------------------------------
 
-*.bak.*
-*.bak
-
-# --- AQUORIX: allow DB migrations to be committed ---
-!db/
-!db/migrations/
-!db/migrations/*.sql
-
-# --- LOCAL BACKUPS / PROOFS (do not commit) ---
-.env.backup-*
+_archive/
+_local_backups_phase8/
 server.js.backup-*
+server.js.bak.*
+db_schema_backup_*.sql
+db_tables_backup_*.sql
 *_PROOF_*.txt
-_evidence_*.txt
-scripts_test_*.js
-test_twilio_whatsapp.js
-src/services/*.backup-*
-*.tgz
+
+node_modules/
