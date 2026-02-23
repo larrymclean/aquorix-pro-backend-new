@@ -11,3 +11,7 @@ db_tables_backup_*.sql
 *_PROOF_*.txt
 
 node_modules/
+
+# Local env (DO NOT COMMIT)
+.env
+.env.*
