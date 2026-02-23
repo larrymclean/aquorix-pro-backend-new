@@ -1706,7 +1706,7 @@ app.get("/api/v1/dashboard/schedule", requireDashboardScope, async (req, res) =>
 });
 
 app.post("/api/v1/dashboard/schedule/sessions", requireDashboardScope, async (req, res) => {
-  const { dive_site_id, dive_datetime, meet_time, notes, session_type, itinerary_id, team_id, vessel_id } = req.body || {};
+  const { dive_site_id, dive_datetime, meet_time, notes, session_type, itinerary_id, team_id, vessel_id, price_per_diver } = req.body || {};
 
   // NOTE: your schema requires itinerary_id + team_id + dive_site_id + dive_datetime
   if (!itinerary_id || !team_id || !dive_site_id || !dive_datetime) {
@@ -1717,27 +1717,74 @@ app.post("/api/v1/dashboard/schedule/sessions", requireDashboardScope, async (re
     });
   }
 
+  // price_per_diver is optional for now, but if provided it must be a valid non-negative number
+  if (price_per_diver !== undefined && price_per_diver !== null && price_per_diver !== "") {
+    const n = Number(price_per_diver);
+    if (!Number.isFinite(n) || n < 0) {
+      return res.status(400).json({
+        ok: false,
+        status: "bad_request",
+        message: "price_per_diver must be a non-negative number"
+      });
+    }
+  }
+
   try {
-    const result = await pool.query(
-      `
-      INSERT INTO aquorix.dive_sessions
-        (operator_id, itinerary_id, team_id, dive_site_id, dive_datetime, meet_time, notes, session_type, vessel_id, updated_at)
-      VALUES
-        ($1, $2, $3, $4, $5::timestamptz, $6::timestamptz, $7, $8, $9, now())
-      RETURNING session_id
-      `,
-      [
-        req.operator_id,
+    // Ledger currency MUST come from operator profile (never from client)
+  const operatorRow = await pool.query(
+  `SELECT default_currency FROM aquorix.diveoperators WHERE operator_id = $1`,
+  [req.operator_id]
+);
+
+if (operatorRow.rowCount === 0) {
+  return res.status(404).json({ ok: false, status: "not_found", message: "Operator not found" });
+}
+
+const operatorCurrency = operatorRow.rows[0].default_currency;
+
+  const result = await pool.query(
+    `
+    INSERT INTO aquorix.dive_sessions
+      (
+        operator_id,
         itinerary_id,
         team_id,
         dive_site_id,
         dive_datetime,
-        meet_time || null,
-        notes || null,
-        session_type || null,
-        vessel_id || null
-      ]
-    );
+        meet_time,
+        notes,
+        session_type,
+        vessel_id,
+        price_per_diver,
+        session_currency,
+        updated_at
+      )
+    VALUES
+      (
+        $1, $2, $3, $4,
+        $5::timestamptz,
+        $6::timestamptz,
+        $7, $8, $9,
+        $10::numeric,
+        $11,
+        now()
+      )
+    RETURNING session_id
+    `,
+    [
+      req.operator_id,
+      itinerary_id,
+      team_id,
+      dive_site_id,
+      dive_datetime,
+      meet_time || null,
+      notes || null,
+      session_type || null,
+      vessel_id || null,
+      price_per_diver !== undefined && price_per_diver !== null && price_per_diver !== "" ? price_per_diver : null,
+      operatorCurrency
+    ]
+  );
 
     return res.status(201).json({ ok: true, status: "created", session_id: String(result.rows[0].session_id) });
   } catch (err) {
@@ -1755,8 +1802,40 @@ app.patch("/api/v1/dashboard/schedule/sessions/:session_id", requireDashboardSco
     meet_time: req.body?.meet_time,
     notes: req.body?.notes,
     session_type: req.body?.session_type,
-    vessel_id: req.body?.vessel_id
+    vessel_id: req.body?.vessel_id,
+    price_per_diver: req.body?.price_per_diver
   };
+
+  // If this session has bookings, lock down critical fields (allow notes only)
+  const coreFieldsLockedWhenBooked = new Set([
+    "dive_site_id",
+    "dive_datetime",
+    "meet_time",
+    "session_type",
+    "vessel_id",
+    "price_per_diver"
+  ]);
+
+  const attemptedKeys = Object.entries(allowed)
+    .filter(([_, v]) => v !== undefined)
+    .map(([k]) => k);
+
+  const isAttemptingLockedChange = attemptedKeys.some((k) => coreFieldsLockedWhenBooked.has(k) && k !== "notes");
+
+  if (isAttemptingLockedChange) {
+    const bookingCountRow = await pool.query(
+      `SELECT COUNT(*)::int AS cnt FROM aquorix.dive_bookings WHERE session_id = $1`,
+      [session_id]
+    );
+
+    if ((bookingCountRow.rows[0]?.cnt || 0) > 0) {
+      return res.status(409).json({
+        ok: false,
+        status: "conflict",
+        message: "Session has bookings. Only notes can be edited."
+      });
+    }
+  }
 
   const setParts = [];
   const values = [];
@@ -1764,7 +1843,16 @@ app.patch("/api/v1/dashboard/schedule/sessions/:session_id", requireDashboardSco
 
   for (const [key, val] of Object.entries(allowed)) {
     if (val === undefined) continue;
-    setParts.push(`${key} = $${idx}`);
+
+    if (key === "dive_datetime" || key === "meet_time") {
+      setParts.push(`${key} = $${idx}::timestamptz`);
+    } else if (key === "price_per_diver") {
+      // numeric(10,3) in DB
+      setParts.push(`${key} = $${idx}::numeric`);
+    } else {
+      setParts.push(`${key} = $${idx}`);
+    }
+
     values.push(val);
     idx++;
   }
