@@ -1,0 +1,223 @@
+/*
+ * AQUORIX Pro Backend - Booking Request Routes (Phase 8.3)
+ * File: bookingsRequest.js
+ * Path: /Users/larrymclean/CascadeProjects/aquorix-backend/src/routes/bookingsRequest.js
+ * Description:
+ *   Extracted route(s) for booking request creation.
+ *   Phase 8.3-A: Booking request MUST snapshot pricing at request-time so approve can proceed.
+ *
+ * Author: Larry McLean
+ * Created: 2026-02-23
+ * Version: 1.0.0
+ *
+ * Status: ACTIVE (Phase 8.3)
+ *
+ * Change Log (append-only):
+ *   - 2026-02-23: v1.0.0 - Extract /api/v1/bookings/request + add pricing snapshot (payment_* fields)
+ */
+
+const { toMinorUnits, normalizeCurrency, minorToMajorDisplay } = require("../lib/money");
+
+module.exports = function registerBookingsRequestRoutes(app, deps) {
+  const {
+    pool,
+    requireAuthUser,
+    requireDashboardScope,
+    HOLD_WINDOW_MINUTES,
+    notifications,
+    notificationStore,
+  } = deps;
+
+  // -----------------------------------------------------------------------------
+  // Phase 7/8: POST /api/v1/bookings/request
+  // Phase 8.3-A: On success, MUST populate:
+  //   - dive_bookings.payment_currency (ledger currency: session_currency)
+  //   - dive_bookings.payment_amount_minor (authoritative)
+  //   - dive_bookings.payment_amount (display-friendly, rounded to 2 decimals)
+  // NOTE: stripe_checkout_session_id must remain NULL until approve
+  // -----------------------------------------------------------------------------
+  app.post(
+    "/api/v1/bookings/request",
+    requireAuthUser,
+    requireDashboardScope,
+    async (req, res) => {
+      try {
+        // IMPORTANT: Preserve the existing operator scoping pattern.
+        // We will use the same operator_id source you already used in server.js route.
+        // (You will paste your existing route body here, then apply the snapshot logic below.)
+
+        // -----------------------------
+        // 1) Extract inputs (keep existing)
+        // -----------------------------
+        const body = req.body || {};
+        const session_id = body.session_id;
+
+        const guest_name = body.guest_name ? String(body.guest_name).trim() : null;
+        const guest_email = body.guest_email ? String(body.guest_email).trim() : null;
+        const guest_phone = body.guest_phone ? String(body.guest_phone).trim() : null;
+        const source = body.source ? String(body.source).trim() : "website";
+        
+        const headcountRaw = body.headcount;
+
+        // Default to 1 if missing/null/empty
+        const headcountParsed = (headcountRaw === undefined || headcountRaw === null || headcountRaw === "")
+          ? 1
+          : Number(headcountRaw);
+
+        // ENFORCE: integer 1..50 only (deterministic)
+        if (!Number.isFinite(headcountParsed) || !Number.isInteger(headcountParsed) || headcountParsed < 1 || headcountParsed > 50) {
+          return res.status(400).json({ error: "headcount must be an integer between 1 and 50" });
+        }
+
+        const headcount = headcountParsed;
+
+        // NOTE: DO NOT accept operator_id from client.
+        // Use existing middleware-derived operator_id pattern.
+        // If your existing code uses a different variable name, keep it exactly.
+        const operator_id = req.operator_id || req.active_operator_id || (req.dashboard && req.dashboard.operator_id);
+
+        if (!operator_id) {
+          return res.status(403).json({ error: "Missing operator scope" });
+        }
+        if (!session_id) {
+          return res.status(400).json({ error: "session_id is required" });
+        }
+
+        // NOTE: This endpoint currently supports guest bookings (website flow).
+        // DB constraint requires: diver_id OR (guest_name AND guest_email).
+        if (!guest_name || !guest_email) {
+          return res.status(400).json({
+            error: "guest_name and guest_email are required for website booking requests",
+            code: "GUEST_IDENTITY_REQUIRED",
+          });
+        }
+
+        // -----------------------------
+        // 2) Load session pricing truth
+        // -----------------------------
+        const s = await pool.query(
+          `
+          SELECT session_id, operator_id, price_per_diver, session_currency
+          FROM aquorix.dive_sessions
+          WHERE session_id = $1
+          LIMIT 1
+          `,
+          [session_id]
+        );
+
+        if (s.rowCount === 0) {
+          return res.status(404).json({ error: "Session not found" });
+        }
+
+        const session = s.rows[0];
+
+        // Optional: enforce operator ownership if session.operator_id is populated
+        if (session.operator_id && Number(session.operator_id) !== Number(operator_id)) {
+          return res.status(403).json({ error: "Session is not owned by active operator" });
+        }
+
+        if (session.price_per_diver === null || session.price_per_diver === undefined) {
+          return res.status(409).json({
+            error: "Session is not priced yet. Cannot create booking request.",
+            code: "SESSION_UNPRICED",
+          });
+        }
+
+        const currency = normalizeCurrency(session.session_currency);
+        if (!currency) {
+          return res.status(500).json({ error: "Invalid session currency configuration" });
+        }
+
+        // price_per_diver is NUMERIC(10,3). Keep it as string for safe math.
+        const pricePerDiverMajorStr = String(session.price_per_diver);
+
+        // total = price_per_diver * headcount (major units string)
+        // We'll do this in Postgres (authoritative) to avoid JS numeric drift,
+        // then compute minor units from that returned major string.
+        const t = await pool.query(
+          `
+          SELECT ($1::numeric * $2::int)::numeric(12,3) AS total_major
+          `,
+          [pricePerDiverMajorStr, headcount]
+        );
+
+        const totalMajorStr = String(t.rows[0].total_major);
+
+        const totalMinorStr = toMinorUnits(totalMajorStr, currency); // bigint string
+        const displayMajor = minorToMajorDisplay(totalMinorStr, currency, 2);
+
+        // -----------------------------
+        // 3) Create booking row (preserve your existing columns)
+        // -----------------------------
+        // IMPORTANT: Keep your existing behavior for HOLD window, guest fields, notifications, etc.
+        // Here we insert the snapshot fields that Phase 8.3 requires.
+
+        const now = new Date();
+        const holdExpiresAt = new Date(now.getTime() + (Number(HOLD_WINDOW_MINUTES) || 10) * 60 * 1000);
+
+        const r = await pool.query(
+          `
+          INSERT INTO aquorix.dive_bookings (
+            operator_id,
+            session_id,
+            headcount,
+            guest_name,
+            guest_email,
+            guest_phone,
+            source,
+            booking_status,
+            payment_status,
+            hold_expires_at,
+            payment_currency,
+            payment_amount_minor,
+            payment_amount
+          )
+          VALUES (
+            $1, $2, $3,
+            $4, $5, $6,
+            $7,
+            'pending',
+            'unpaid',
+            $8,
+            $9,
+            $10::bigint,
+            $11::numeric(10,2)
+          )
+          RETURNING booking_id
+          `,
+          [
+            operator_id,
+            session_id,
+            headcount,
+            guest_name,
+            guest_email,
+            guest_phone,
+            source,
+            holdExpiresAt,
+            currency,
+            totalMinorStr,
+            displayMajor, // display-friendly numeric(10,2)
+          ]
+        );
+
+        const booking_id = r.rows[0].booking_id;
+
+        // -----------------------------
+        // 4) Return minimal payload (keep compatible with existing clients)
+        // -----------------------------
+        return res.status(201).json({
+          booking_id,
+          session_id,
+          operator_id,
+          headcount,
+          payment_currency: currency,
+          payment_amount_minor: totalMinorStr,
+          payment_amount: displayMajor,
+        });
+      } catch (err) {
+        console.error("[8.3-A] bookings/request failed:", err && err.stack ? err.stack : err);
+        return res.status(500).json({ error: "Booking request failed" });
+      }
+    }
+  );
+};
