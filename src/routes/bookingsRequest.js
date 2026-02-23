@@ -8,12 +8,15 @@
  *
  * Author: Larry McLean
  * Created: 2026-02-23
- * Version: 1.0.0
+ * Version: 1.1.0
  *
  * Status: ACTIVE (Phase 8.3)
  *
  * Change Log (append-only):
  *   - 2026-02-23: v1.0.0 - Extract /api/v1/bookings/request + add pricing snapshot (payment_* fields)
+ *   - 2026-02-23: v1.1.0 - Enforce guest_or_diver DB constraint (guest_name + guest_email required for website flow);
+ *                         Harden headcount validation (integer 1..50);
+ *                         Confirm enum-safe booking_status = 'pending'
  */
 
 const { toMinorUnits, normalizeCurrency, minorToMajorDisplay } = require("../lib/money");
