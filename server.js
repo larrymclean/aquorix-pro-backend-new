@@ -57,6 +57,7 @@ const { requireDashboardScopeFactory } = require('./src/middleware/requireDashbo
 const { getStripeClient } = require('./src/services/stripe');
 const { createPaymentsWebhookRouter } = require("./src/routes/paymentsWebhook");
 const registerBookingsRequestRoutes = require("./src/routes/bookingsRequest");
+const registerBookingsPaymentLinkRoutes = require("./src/routes/bookingsPaymentLink");
 
 // -----------------------------------------------------------------------------
 // Phase 7 (Viking): Notifications + DB Notification Store
@@ -149,6 +150,12 @@ registerBookingsRequestRoutes(app, {
   HOLD_WINDOW_MINUTES,
   notifications,
   notificationStore,
+});
+
+registerBookingsPaymentLinkRoutes(app, {
+  pool,
+  requireDashboardScope,
+  getStripeClient,
 });
 
 // -----------------------------------------------------------------------------
@@ -529,6 +536,28 @@ app.get("/api/v1/dashboard/bookings", requireDashboardScope, async (req, res) =>
         b.booking_id,
         b.booking_status::text AS booking_status,
         b.payment_status::text AS payment_status,
+        b.payment_currency,
+        b.payment_amount_minor,
+        b.payment_amount,
+        b.hold_expires_at,
+        b.stripe_checkout_session_id,
+
+        CASE
+          WHEN b.booking_status::text = 'cancelled' THEN 'cancelled'
+          WHEN b.booking_status::text = 'confirmed' AND b.payment_status::text = 'paid' THEN 'paid_confirmed'
+          WHEN b.payment_status::text = 'paid' AND b.booking_status::text <> 'confirmed' THEN 'paid_manual_review'
+          WHEN b.stripe_checkout_session_id IS NOT NULL
+            AND b.payment_status::text = 'unpaid'
+            AND b.hold_expires_at IS NOT NULL
+            AND b.hold_expires_at > now()
+          THEN 'awaiting_payment'
+          WHEN b.stripe_checkout_session_id IS NOT NULL
+            AND b.payment_status::text = 'unpaid'
+            AND (b.hold_expires_at IS NULL OR b.hold_expires_at <= now())
+          THEN 'payment_link_expired'
+          WHEN b.payment_amount_minor IS NULL THEN 'needs_pricing_snapshot'
+          ELSE 'pending'
+        END AS ui_status,
         b.headcount,
         b.guest_name,
         b.guest_email,
