@@ -116,6 +116,11 @@ function registerDashboardBookingsRoutes(app, { pool, requireDashboardScope }) {
           b.stripe_checkout_session_id,
 
           CASE
+            WHEN b.payment_status::text = 'paid' AND b.booking_status::text <> 'confirmed' THEN true
+            ELSE false
+          END AS requires_manual_review,
+
+          CASE
             WHEN b.booking_status::text = 'cancelled' THEN 'cancelled'
             WHEN b.booking_status::text = 'confirmed'
                  AND b.payment_status::text = 'paid'
