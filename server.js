@@ -55,6 +55,7 @@ const { requireAuthUserFactory } = require('./src/middleware/requireAuthUser');
 const { requireDashboardScopeFactory } = require('./src/middleware/requireDashboardScope');
 
 const { getStripeClient } = require('./src/services/stripe');
+const { createPaymentsWebhookRouter } = require("./src/routes/paymentsWebhook");
 const registerBookingsRequestRoutes = require("./src/routes/bookingsRequest");
 
 // -----------------------------------------------------------------------------
@@ -64,6 +65,14 @@ const notifications = require("./src/services/notifications");
 const notificationStore = require("./src/services/notificationStore");
 
 const app = express();
+
+// Stripe webhook MUST use raw body BEFORE express.json()
+app.use(
+  "/api/v1/payments/webhook",
+  express.raw({ type: "application/json" }),
+  createPaymentsWebhookRouter({ pool })
+);
+
 const port = process.env.PORT || 3001;
 
 // -----------------------------------------------------------------------------
