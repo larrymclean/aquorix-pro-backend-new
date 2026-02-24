@@ -235,9 +235,9 @@ async function bestEffortInsertPaymentEvent(pool, event) {
   // If your schema is different, we will adjust after you show me \d aquorix.payment_events.
   const payload = JSON.stringify(event);
 
-  await pool.query(
+    await pool.query(
     `
-    INSERT INTO aquorix.payment_events (event_id, event_type, stripe_payload_json, received_at, processing_status)
+    INSERT INTO aquorix.payment_events (event_id, event_type, raw_event, received_at, processing_status)
     VALUES ($1, $2, $3::jsonb, NOW(), 'received')
     ON CONFLICT (event_id) DO NOTHING
     `,
