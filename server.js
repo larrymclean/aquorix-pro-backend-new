@@ -55,6 +55,7 @@ const { requireAuthUserFactory } = require('./src/middleware/requireAuthUser');
 const { requireDashboardScopeFactory } = require('./src/middleware/requireDashboardScope');
 
 const { getStripeClient } = require('./src/services/stripe');
+const registerBookingsRequestRoutes = require("./src/routes/bookingsRequest");
 
 // -----------------------------------------------------------------------------
 // Phase 7 (Viking): Notifications + DB Notification Store
@@ -128,6 +129,18 @@ pool.connect(async (err, client, release) => {
 
 const requireAuthUser = requireAuthUserFactory({ pool });
 const requireDashboardScope = requireDashboardScopeFactory({ pool });
+
+// -----------------------------------------------------------------------------
+// Phase 8.3-A: Route Extraction - Booking Request
+// -----------------------------------------------------------------------------
+registerBookingsRequestRoutes(app, {
+  pool,
+  requireAuthUser,
+  requireDashboardScope,
+  HOLD_WINDOW_MINUTES,
+  notifications,
+  notificationStore,
+});
 
 // -----------------------------------------------------------------------------
 // Phase 7: Operator Capacity (Viking Configurable)
@@ -429,206 +442,6 @@ app.post("/api/v1/operator/active", requireAuthUser, async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// PHASE 7 (VIKING): BOOKINGS - Request (Public / Widget / Internal Test)
-// POST /api/v1/bookings/request
-//
-// Rules:
-// - Never accept operator_id from client. Derive from dive_sessions.
-// - Insert booking first (MUST succeed even if notifications fail).
-// - Notifications are best-effort and ALWAYS logged to aquorix.notifications.
-// - booking_status uses enum values: confirmed | pending | cancelled
-// -----------------------------------------------------------------------------
-app.post("/api/v1/bookings/request", async (req, res) => {
-  const {
-    session_id,
-    guest_name,
-    guest_email,
-    guest_phone,
-    headcount,
-    special_requests,
-    source
-  } = req.body || {};
-
-  // 1) Validate required fields (matches your CHECK constraint)
-  const sidNum = Number(session_id);
-  if (!Number.isFinite(sidNum) || sidNum <= 0) {
-    return res.status(400).json({ ok: false, status: "bad_request", message: "session_id must be a positive number" });
-  }
-
-  if (!guest_name || String(guest_name).trim().length === 0) {
-    return res.status(400).json({ ok: false, status: "bad_request", message: "guest_name is required" });
-  }
-
-  if (!guest_email || String(guest_email).trim().length === 0) {
-    return res.status(400).json({ ok: false, status: "bad_request", message: "guest_email is required" });
-  }
-
-  const guest_email_normalized = String(guest_email).trim().toLowerCase();
-
-  const hc = headcount === undefined || headcount === null ? 1 : Number(headcount);
-  if (!Number.isFinite(hc) || hc <= 0) {
-    return res.status(400).json({ ok: false, status: "bad_request", message: "headcount must be a positive number" });
-  }
-
-  // Source defaults to 'website' to match your table default convention
-  const src = (source && String(source).trim().length > 0) ? String(source).trim() : "website";
-
-  let operator_id = null;
-  let itinerary_id = null;
-  let dive_datetime = null;
-
-  try {
-    // 2) Resolve session → derive operator_id + itinerary_id
-    const s = await pool.query(
-      `
-      SELECT session_id, operator_id, itinerary_id, dive_datetime
-      FROM aquorix.dive_sessions
-      WHERE session_id = $1 AND cancelled_at IS NULL
-      LIMIT 1
-      `,
-      [sidNum]
-    );
-
-    if (s.rowCount === 0) {
-      return res.status(404).json({ ok: false, status: "not_found", message: "Session not found (or cancelled)" });
-    }
-
-    operator_id = s.rows[0].operator_id;
-    itinerary_id = s.rows[0].itinerary_id;
-    dive_datetime = s.rows[0].dive_datetime;
-
-    // 3) Insert booking (MUST succeed even if notifications fail)
-    const b = await pool.query(
-      `
-      INSERT INTO aquorix.dive_bookings
-        (itinerary_id, operator_id, booking_status, session_id, headcount, guest_name, guest_email, guest_phone, special_requests, source, hold_expires_at, created_at, updated_at)
-      VALUES
-        ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, now() + ($10::int * interval '1 minute'), now(), now())
-      RETURNING booking_id
-      `,
-      [
-        itinerary_id,
-        operator_id,
-        sidNum,
-        hc,
-        String(guest_name).trim(),
-        guest_email_normalized,
-        guest_phone ? String(guest_phone).trim() : null,
-        special_requests ? String(special_requests).trim() : null,
-        src,
-        HOLD_WINDOW_MINUTES
-      ]
-    );
-
-    const booking_id = b.rows[0].booking_id;
-
-    // 4) Best-effort notifications (DO NOT block response)
-    // WhatsApp (operator)
-    (async () => {
-      const waBody =
-        `NEW BOOKING REQUEST\n\n` +
-        `${String(guest_name).trim()}\n` +
-        `Party of ${hc}\n` +
-        `Session ID: ${sidNum}\n\n` +
-        `Approve in AQUORIX dashboard`;
-
-      try {
-        const waResp = await notifications.sendOperatorWhatsApp({ body: waBody });
-
-        await notificationStore.logSent(pool, {
-          recipient_type: "operator",
-          recipient_email: waResp.to || process.env.VIKING_TEST_WHATSAPP_TO || "whatsapp:unknown",
-          event_type: "booking_request.operator.whatsapp",
-          subject: null,
-          body: waBody,
-          booking_id,
-          session_id: sidNum,
-          operator_id
-        });
-        } catch (e) {
-        try {
-          await notificationStore.logFailed(pool, {
-            recipient_type: "operator",
-            recipient_email: process.env.VIKING_TEST_WHATSAPP_TO || "whatsapp:unknown",
-            event_type: "booking_request.operator.whatsapp",
-            subject: null,
-            body: waBody,
-            error_message: e && e.message ? e.message : String(e),
-            booking_id,
-            session_id: sidNum,
-            operator_id
-          });
-        } catch (logErr) {
-          console.error("[bookings/request] whatsapp notify failed AND logFailed failed:", logErr);
-        }
-      }
-
-    })();
-
-    // Email (operator)
-    (async () => {
-      const subject = `New Booking Request - ${String(guest_name).trim()} (${hc})`;
-      const html = `
-        <h2>New Booking Request</h2>
-        <p><b>Guest:</b> ${String(guest_name).trim()}</p>
-        <p><b>Headcount:</b> ${hc}</p>
-        <p><b>Session ID:</b> ${sidNum}</p>
-        ${dive_datetime ? `<p><b>Dive Time:</b> ${String(dive_datetime)}</p>` : ``}
-        ${guest_phone ? `<p><b>Phone:</b> ${String(guest_phone).trim()}</p>` : ``}
-        <p><b>Email:</b> ${String(guest_email).trim()}</p>
-        ${special_requests ? `<p><b>Special Requests:</b><br/>${String(special_requests).trim()}</p>` : ``}
-        <hr/>
-        <p>Review in the AQUORIX dashboard.</p>
-      `;
-
-      try {
-        const emResp = await notifications.sendOperatorEmail({ subject, html });
-
-        await notificationStore.logSent(pool, {
-          recipient_type: "operator",
-          recipient_email: process.env.VIKING_OPERATOR_NOTIFICATION_EMAIL || "operator_email:unknown",
-          event_type: "booking_request.operator.email",
-          subject,
-          body: html,
-          booking_id,
-          session_id: sidNum,
-          operator_id
-        });
-            } catch (e) {
-        try {
-          await notificationStore.logFailed(pool, {
-            recipient_type: "operator",
-            recipient_email: process.env.VIKING_OPERATOR_NOTIFICATION_EMAIL || "operator_email:unknown",
-            event_type: "booking_request.operator.email",
-            subject,
-            body: html,
-            error_message: e && e.message ? e.message : String(e),
-            booking_id,
-            session_id: sidNum,
-            operator_id
-          });
-        } catch (logErr) {
-          console.error("[bookings/request] email notify failed AND logFailed failed:", logErr);
-        }
-      }
-
-    })();
-
-    // 5) Respond immediately (do NOT wait for notifications)
-    return res.status(201).json({
-      ok: true,
-      status: "created",
-      booking_id: String(booking_id),
-      booking_status: "pending"
-    });
-
-  } catch (err) {
-    console.error("[POST /api/v1/bookings/request] Error:", err && err.stack ? err.stack : err);
-    return res.status(500).json({ ok: false, status: "error", message: "Internal server error" });
-  }
-});
-
-// -----------------------------------------------------------------------------
 // PHASE 7 (VIKING): DASHBOARD BOOKINGS LIST (Scoped to active operator)
 // GET /api/v1/dashboard/bookings?week_start=YYYY-MM-DD
 //
@@ -824,6 +637,7 @@ app.post("/api/v1/dashboard/bookings/:booking_id/approve", requireDashboardScope
         guest_email,
         guest_name,
         payment_amount,
+        payment_amount_minor,
         payment_currency,
         hold_expires_at,
         stripe_checkout_session_id
@@ -902,16 +716,20 @@ app.post("/api/v1/dashboard/bookings/:booking_id/approve", requireDashboardScope
       });
     }
 
-    // 5) Amount authority (Phase 8 MVP rule)
-    // booking.payment_amount must be present (numeric 10,2)
-    const amt = booking.payment_amount;
-    const amountNumber = amt === null || typeof amt === "undefined" ? NaN : Number(amt);
-    if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
+    // 5) Amount authority (Phase 8.3 rule)
+    // - payment_amount_minor is authoritative (BIGINT)
+    // - payment_amount is display-only (NUMERIC(10,2)) and MUST NOT be used to recompute minor units
+    const minorRaw = booking.payment_amount_minor;
+
+    // Normalize to a finite Number for arithmetic/validation (safe for our typical booking sizes)
+    const ledger_minor_num = (minorRaw === null || typeof minorRaw === "undefined") ? NaN : Number(minorRaw);
+
+    if (!Number.isFinite(ledger_minor_num) || ledger_minor_num <= 0) {
       await client.query("ROLLBACK");
       return res.status(400).json({
         ok: false,
         status: "bad_request",
-        message: "payment_amount is missing on booking; set payment_amount before initiating Stripe checkout",
+        message: "payment_amount_minor is missing on booking; create booking request pricing snapshot before initiating Stripe checkout",
         booking_id: String(booking_id)
       });
     }
@@ -949,20 +767,26 @@ app.post("/api/v1/dashboard/bookings/:booking_id/approve", requireDashboardScope
     const charge_currency_lower = (isDev && forceCurrencyLower) ? forceCurrencyLower : platformChargeCurrencyLower;
     const charge_currency_upper = charge_currency_lower.toUpperCase();
 
-    // Ledger minor units (e.g., 50.00 JOD -> 50000 minor, because JOD=1000)
+    // Ledger minor units (authoritative snapshot from booking request)
     const ledger_multiplier = minorUnitMultiplier(ledger_currency_upper);
-    const ledger_amount_minor = Math.round(amountNumber * ledger_multiplier);
 
-    if (!Number.isFinite(ledger_amount_minor) || ledger_amount_minor <= 0) {
+    // IMPORTANT: This is the Phase 8.3 lock — DO NOT recompute minor units from payment_amount.
+    // We rely on the snapshot from /api/v1/bookings/request.
+    const ledger_amount_minor = ledger_minor_num;
+
+    // Derive a ledger major amount for display + FX arithmetic only
+    const amountNumber = ledger_amount_minor / ledger_multiplier;
+
+    if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
       await client.query("ROLLBACK");
       return res.status(400).json({
         ok: false,
         status: "bad_request",
-        message: "Invalid computed payment_amount_minor (ledger)",
-        payment_amount: String(amountNumber),
+        message: "Invalid derived ledger major amount from payment_amount_minor (ledger)",
         ledger_currency: ledger_currency_upper,
         ledger_multiplier: String(ledger_multiplier),
-        payment_amount_minor: String(ledger_amount_minor)
+        payment_amount_minor: String(ledger_amount_minor),
+        payment_amount_major_derived: String(amountNumber)
       });
     }
 
@@ -1101,7 +925,7 @@ app.post("/api/v1/dashboard/bookings/:booking_id/approve", requireDashboardScope
       `,
       [
         String(checkoutSession.id),
-        ledger_amount_minor,
+        String(ledger_amount_minor),
         charge_currency_upper,
         charge_amount_minor,
         fx_rate_estimate,

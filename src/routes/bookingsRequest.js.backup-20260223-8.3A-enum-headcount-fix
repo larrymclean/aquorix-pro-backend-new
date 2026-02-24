@@ -8,15 +8,12 @@
  *
  * Author: Larry McLean
  * Created: 2026-02-23
- * Version: 1.1.0
+ * Version: 1.0.0
  *
  * Status: ACTIVE (Phase 8.3)
  *
  * Change Log (append-only):
  *   - 2026-02-23: v1.0.0 - Extract /api/v1/bookings/request + add pricing snapshot (payment_* fields)
- *   - 2026-02-23: v1.1.0 - Enforce guest_or_diver DB constraint (guest_name + guest_email required for website flow);
- *                         Harden headcount validation (integer 1..50);
- *                         Confirm enum-safe booking_status = 'pending'
  */
 
 const { toMinorUnits, normalizeCurrency, minorToMajorDisplay } = require("../lib/money");
@@ -52,27 +49,10 @@ module.exports = function registerBookingsRequestRoutes(app, deps) {
         // -----------------------------
         // 1) Extract inputs (keep existing)
         // -----------------------------
-        const body = (req && req.body) ? req.body : {};
+        const body = req.body || {};
         const session_id = body.session_id;
-
-        const guest_name = body.guest_name ? String(body.guest_name).trim() : null;
-        const guest_email = body.guest_email ? String(body.guest_email).trim() : null;
-        const guest_phone = body.guest_phone ? String(body.guest_phone).trim() : null;
-        const source = body.source ? String(body.source).trim() : "website";
-        
         const headcountRaw = body.headcount;
-
-        // Default to 1 if missing/null/empty
-        const headcountParsed = (headcountRaw === undefined || headcountRaw === null || headcountRaw === "")
-          ? 1
-          : Number(headcountRaw);
-
-        // ENFORCE: integer 1..50 only (deterministic)
-        if (!Number.isFinite(headcountParsed) || !Number.isInteger(headcountParsed) || headcountParsed < 1 || headcountParsed > 50) {
-          return res.status(400).json({ error: "headcount must be an integer between 1 and 50" });
-        }
-
-        const headcount = headcountParsed;
+        const headcount = Number.isFinite(Number(headcountRaw)) ? Number(headcountRaw) : 1;
 
         // NOTE: DO NOT accept operator_id from client.
         // Use existing middleware-derived operator_id pattern.
@@ -85,14 +65,8 @@ module.exports = function registerBookingsRequestRoutes(app, deps) {
         if (!session_id) {
           return res.status(400).json({ error: "session_id is required" });
         }
-
-        // NOTE: This endpoint currently supports guest bookings (website flow).
-        // DB constraint requires: diver_id OR (guest_name AND guest_email).
-        if (!guest_name || !guest_email) {
-          return res.status(400).json({
-            error: "guest_name and guest_email are required for website booking requests",
-            code: "GUEST_IDENTITY_REQUIRED",
-          });
+        if (!Number.isFinite(headcount) || headcount <= 0) {
+          return res.status(400).json({ error: "headcount must be a positive number" });
         }
 
         // -----------------------------
@@ -164,10 +138,6 @@ module.exports = function registerBookingsRequestRoutes(app, deps) {
             operator_id,
             session_id,
             headcount,
-            guest_name,
-            guest_email,
-            guest_phone,
-            source,
             booking_status,
             payment_status,
             hold_expires_at,
@@ -177,14 +147,12 @@ module.exports = function registerBookingsRequestRoutes(app, deps) {
           )
           VALUES (
             $1, $2, $3,
-            $4, $5, $6,
-            $7,
-            'pending',
+            'hold',
             'unpaid',
-            $8,
-            $9,
-            $10::bigint,
-            $11::numeric(10,2)
+            $4,
+            $5,
+            $6::bigint,
+            $7::numeric(10,2)
           )
           RETURNING booking_id
           `,
@@ -192,10 +160,6 @@ module.exports = function registerBookingsRequestRoutes(app, deps) {
             operator_id,
             session_id,
             headcount,
-            guest_name,
-            guest_email,
-            guest_phone,
-            source,
             holdExpiresAt,
             currency,
             totalMinorStr,
