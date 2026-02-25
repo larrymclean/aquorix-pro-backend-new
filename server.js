@@ -6,7 +6,7 @@
  *
  * Author: Larry McLean
  * Created: 2025-07-01
- * Version: 1.2.8
+ * Version: 1.2.9
  *
  * Last Updated: 2026-02-21
  * Status: ACTIVE (Local-first Dev / Phase 4-8)
@@ -39,7 +39,8 @@
  *   - 2026-02-20: v1.2.8 - Phase 8: Approve Booking => Stripe Checkout (payment spine) + idempotent checkout session creation
  *   - 2026-02-21: v1.2.8 - Phase 8.1: Dual-currency policy (ledger JOD, charge USD) + FX estimate + store stripe_charge_* + fx_rate_* fields
  *   - 2026-02-21: v1.2.8 - Phase 8.1: Fix Postgres param typing for nullable FX fields (explicit casts)
- *  - 2026-02-21: v1.2.8 - Phase 8.1: Dual-currency Stripe Checkout (JOD ledger + USD charge) with FX estimate + minor-unit hardening (JOD=3, USD=2); store stripe_charge_* + fx_rate_* fields; approve endpoint returns ledger + charge amounts; idempotent checkout retrieval
+ *   - 2026-02-21: v1.2.8 - Phase 8.1: Dual-currency Stripe Checkout (JOD ledger + USD charge) with FX estimate + minor-unit hardening (JOD=3, USD=2); store stripe_charge_* + fx_rate_* fields; approve endpoint returns ledger + charge amounts; idempotent checkout retrieval
+ * - 2026-02-25: v1.2.9 - Phase 8.3: Add success landing routes
  */
 
 require('dotenv').config();
@@ -57,6 +58,7 @@ const { requireDashboardScopeFactory } = require('./src/middleware/requireDashbo
 const { getStripeClient } = require('./src/services/stripe');
 const { createPaymentsWebhookRouter } = require("./src/routes/paymentsWebhook");
 const registerBookingsRequestRoutes = require("./src/routes/bookingsRequest");
+const registerBookingsPurchaseRoutes = require("./src/routes/bookingsPurchase");
 const registerBookingsPaymentLinkRoutes = require("./src/routes/bookingsPaymentLink");
 const registerDashboardBookingsRoutes = require("./src/routes/dashboardBookings");
 const registerDashboardBookingApproveRoutes = require("./src/routes/dashboardBookingApprove");
@@ -105,6 +107,31 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 app.use(express.json());
+
+// -----------------------------------------------------------------------------
+// Phase 8.3 (Local Dev): Stripe return landing endpoints
+// - Stripe Checkout success/cancel URLs may point here in local dev.
+// - These endpoints are intentionally simple and MUST NOT affect webhook truth.
+// -----------------------------------------------------------------------------
+app.get("/api/v1/stripe/success", (req, res) => {
+  const session_id = req.query && req.query.session_id ? String(req.query.session_id) : null;
+  res.status(200).json({
+    ok: true,
+    route: "/api/v1/stripe/success",
+    message: "Stripe Checkout returned successfully (webhook will confirm booking).",
+    stripe_checkout_session_id: session_id
+  });
+});
+
+app.get("/api/v1/stripe/cancel", (req, res) => {
+  const session_id = req.query && req.query.session_id ? String(req.query.session_id) : null;
+  res.status(200).json({
+    ok: true,
+    route: "/api/v1/stripe/cancel",
+    message: "Stripe Checkout was cancelled by the user (booking remains pending/unpaid).",
+    stripe_checkout_session_id: session_id
+  });
+});
 
 async function logDbFingerprint() {
   try {
@@ -176,6 +203,15 @@ registerBookingsRequestRoutes(app, {
   HOLD_WINDOW_MINUTES,
   notifications,
   notificationStore,
+});
+
+registerBookingsPurchaseRoutes(app, {
+  pool,
+  requireAuthUser,
+  HOLD_WINDOW_MINUTES,
+  getStripeClient,
+  getOperatorDefaultCapacity,
+  getCapacityConsumedForSession,
 });
 
 registerBookingsPaymentLinkRoutes(app, {
