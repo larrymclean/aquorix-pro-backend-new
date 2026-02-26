@@ -5,7 +5,9 @@
  * ----------------------------------------------------------------------------
  * Extracted from server.js (lines 469–629)
  * Phase: 8.3C – Dashboard Extraction
- * Date: 2026-02-25
+ * 
+ * Created: 2026-02-25
+ * Version: v1.0.1
  * ----------------------------------------------------------------------------
  * Purpose:
  *   GET /api/v1/dashboard/bookings
@@ -17,7 +19,8 @@
  *   - Improvements occur AFTER successful extraction.
  *
  * Change Log:
- *   2026-02-25 – Initial extraction from server.js (no logic changes).
+ *   - 2026-02-25 – v1.0.0 - Initial extraction from server.js (no logic changes).
+ *   - 2026-02-25 – v1.0.1 - Add dashboard cockpit fields, Rename derived flag
  * ============================================================================
  */
 
@@ -114,11 +117,20 @@ function registerDashboardBookingsRoutes(app, { pool, requireDashboardScope }) {
           b.payment_amount,
           b.hold_expires_at,
           b.stripe_checkout_session_id,
+          b.paid_at,
+          b.manual_review_required,
+          b.manual_review_reason,
+          b.manual_review_flagged_at,
+          b.stripe_payment_intent_id,
+          b.stripe_charge_currency,
+          b.stripe_charge_amount_minor,
+          b.fx_rate_estimate,
+          b.fx_rate_source,
 
           CASE
             WHEN b.payment_status::text = 'paid' AND b.booking_status::text <> 'confirmed' THEN true
             ELSE false
-          END AS requires_manual_review,
+          END AS requires_manual_review_derived,
 
           CASE
             WHEN b.booking_status::text = 'cancelled' THEN 'cancelled'

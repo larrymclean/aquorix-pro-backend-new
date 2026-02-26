@@ -10,7 +10,7 @@
  *     - If payment arrives in time => paid + confirmed
  *
  * Created: 2026-02-24
- * Version: v8.3.0
+ * Version: v8.3.1
  *
  * Environment:
  *   - STRIPE_WEBHOOK_SECRET (required)
@@ -21,6 +21,10 @@
  *     - Insert payment event (best-effort; non-blocking)
  *     - Confirm booking on payment when hold is valid
  *     - Flag manual review on late payment (strict hold contract)
+ *  - 2026-02-25 — v8.3.1
+ *     - Persist stripe_payment_intent_id into dive_bookings via COALESCE (idempotent)
+ *     - Persist stripe_payment_intent_id into payment_events (best-effort)
+ *     - Mark payment_events processed for all handled outcomes (including ignored events)
  * ============================================================================
  */
 
@@ -80,6 +84,10 @@ function createPaymentsWebhookRouter({ pool }) {
           break;
       }
 
+      await bestEffortMarkPaymentEventProcessed(pool, event).catch((e) => {
+        console.error("[webhook] payment_events mark processed best-effort failed:", e && e.message ? e.message : e);
+      });
+
       // IMPORTANT: Always return 2xx for processed/ignored events
       // so Stripe does not retry endlessly.
       return res.status(200).json({ ok: true });
@@ -111,6 +119,9 @@ async function handleCheckoutSessionCompleted({ pool, event }) {
   if (!session) throw new Error("checkout.session.completed missing session object");
 
   const stripeCheckoutSessionId = String(session.id);
+
+  const stripePaymentIntentId =
+  session.payment_intent ? String(session.payment_intent) : null;
 
   // Prefer metadata.booking_id if present; fallback to lookup by checkout session id.
   const metadata = session.metadata || {};
@@ -152,15 +163,17 @@ async function handleCheckoutSessionCompleted({ pool, event }) {
       await client.query(
         `
         UPDATE aquorix.dive_bookings
-           SET payment_status = 'paid',
-               paid_at = NOW(),
-               manual_review_required = true,
-               manual_review_reason = $2,
-               manual_review_flagged_at = NOW()
-         WHERE booking_id = $1
+          SET payment_status = 'paid',
+              paid_at = NOW(),
+              stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, $2),
+              manual_review_required = true,
+              manual_review_reason = $3,
+              manual_review_flagged_at = NOW()
+        WHERE booking_id = $1
         `,
         [
           booking.booking_id,
+          stripePaymentIntentId,
           "payment_received_after_hold_expiry",
         ]
       );
@@ -173,12 +186,13 @@ async function handleCheckoutSessionCompleted({ pool, event }) {
     await client.query(
       `
       UPDATE aquorix.dive_bookings
-         SET payment_status = 'paid',
-             paid_at = NOW(),
-             booking_status = 'confirmed'
-       WHERE booking_id = $1
+        SET payment_status = 'paid',
+            paid_at = NOW(),
+            stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, $2),
+            booking_status = 'confirmed'
+      WHERE booking_id = $1
       `,
-      [booking.booking_id]
+      [booking.booking_id, stripePaymentIntentId]
     );
 
     await client.query("COMMIT");
@@ -230,6 +244,9 @@ async function loadBookingForUpdate({ client, bookingIdFromMetadata, stripeCheck
 async function bestEffortInsertPaymentEvent(pool, event) {
   const eventId = String(event.id);
   const eventType = String(event.type);
+  const sessionObj = event && event.data && event.data.object ? event.data.object : null;
+  const stripePaymentIntentId =
+    sessionObj && sessionObj.payment_intent ? String(sessionObj.payment_intent) : null;
 
   // Store JSON payload for audit. If the table differs, this will fail and be caught upstream.
   // If your schema is different, we will adjust after you show me \d aquorix.payment_events.
@@ -237,11 +254,18 @@ async function bestEffortInsertPaymentEvent(pool, event) {
 
     await pool.query(
     `
-    INSERT INTO aquorix.payment_events (event_id, event_type, raw_event, received_at, processing_status)
-    VALUES ($1, $2, $3::jsonb, NOW(), 'received')
+    INSERT INTO aquorix.payment_events (
+      event_id,
+      event_type,
+      raw_event,
+      received_at,
+      processing_status,
+      stripe_payment_intent_id
+    )
+    VALUES ($1, $2, $3::jsonb, NOW(), 'received', $4)
     ON CONFLICT (event_id) DO NOTHING
     `,
-    [eventId, eventType, payload]
+    [eventId, eventType, payload, stripePaymentIntentId]
   );
 }
 
@@ -258,6 +282,21 @@ async function bestEffortMarkPaymentEventError(pool, event, err) {
      WHERE event_id = $1
     `,
     [eventId, message]
+  );
+}
+
+async function bestEffortMarkPaymentEventProcessed(pool, event) {
+  const eventId = String(event.id);
+
+  await pool.query(
+    `
+    UPDATE aquorix.payment_events
+       SET processing_status = 'processed',
+           processed_at = NOW(),
+           error_message = NULL
+     WHERE event_id = $1
+    `,
+    [eventId]
   );
 }
 
