@@ -5,11 +5,10 @@
  * Description: Extracted route for approving a booking and creating Stripe Checkout session
  *
  * Created: 2026-02-25
- * Version: 1.0.1
+ * Version: 1.0.0
  *
  * Change Log (append-only):
  *   - 2026-02-25: v1.0.0 - Extracted POST /api/v1/dashboard/bookings/:booking_id/approve from server.js (no behavior change)
- *  *   - 2026-02-28: v1.0.1 - Removed runtime debug fingerprint log after confirming correct approve handler + checkout_url behavior
  */
 
 module.exports = function registerDashboardBookingApproveRoutes(app, deps) {

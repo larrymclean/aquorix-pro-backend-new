@@ -5,11 +5,10 @@
  * Description: Extracted route for approving a booking and creating Stripe Checkout session
  *
  * Created: 2026-02-25
- * Version: 1.0.1
+ * Version: 1.0.0
  *
  * Change Log (append-only):
  *   - 2026-02-25: v1.0.0 - Extracted POST /api/v1/dashboard/bookings/:booking_id/approve from server.js (no behavior change)
- *  *   - 2026-02-28: v1.0.1 - Removed runtime debug fingerprint log after confirming correct approve handler + checkout_url behavior
  */
 
 module.exports = function registerDashboardBookingApproveRoutes(app, deps) {
@@ -33,6 +32,7 @@ module.exports = function registerDashboardBookingApproveRoutes(app, deps) {
   // POST /api/v1/dashboard/bookings/:booking_id/approve
   // ---------------------------------------------------------------------------
   app.post("/api/v1/dashboard/bookings/:booking_id/approve", requireDashboardScope, async (req, res) => {
+    console.log("[AQX APPROVE HIT]", new Date().toISOString(), "file=", __filename, "booking_id=", req.params.booking_id);
     const booking_id = Number(req.params.booking_id);
     if (!Number.isFinite(booking_id) || booking_id <= 0) {
       return res.status(400).json({ ok: false, status: "bad_request", message: "Invalid booking_id" });
