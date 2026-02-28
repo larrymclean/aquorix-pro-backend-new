@@ -10,7 +10,7 @@
  *     - If payment arrives in time => paid + confirmed
  *
  * Created: 2026-02-24
- * Version: v8.3.2
+ * Version: v8.3.1
  *
  * Environment:
  *   - STRIPE_WEBHOOK_SECRET (required)
@@ -25,8 +25,6 @@
  *     - Persist stripe_payment_intent_id into dive_bookings via COALESCE (idempotent)
  *     - Persist stripe_payment_intent_id into payment_events (best-effort)
  *     - Mark payment_events processed for all handled outcomes (including ignored events)
- *  - 2026-02-26 — v8.3.2
- *     - Webhook fix - insert stripe_checkout_session_id
  * ============================================================================
  */
 
@@ -246,34 +244,15 @@ async function loadBookingForUpdate({ client, bookingIdFromMetadata, stripeCheck
 async function bestEffortInsertPaymentEvent(pool, event) {
   const eventId = String(event.id);
   const eventType = String(event.type);
-  const obj = event && event.data && event.data.object ? event.data.object : null;
+  const sessionObj = event && event.data && event.data.object ? event.data.object : null;
+  const stripePaymentIntentId =
+    sessionObj && sessionObj.payment_intent ? String(sessionObj.payment_intent) : null;
 
-  // Extract IDs defensively across event types:
-  // - checkout.session.* => obj.id starts with "cs_"
-  // - payment_intent.*   => obj.id starts with "pi_"
-  // - charge.*           => obj.payment_intent often exists
-  let stripeCheckoutSessionId = null;
-  let stripePaymentIntentId = null;
-
-  if (obj) {
-    if (obj.id && typeof obj.id === "string") {
-      if (obj.id.startsWith("cs_")) stripeCheckoutSessionId = String(obj.id);
-      if (obj.id.startsWith("pi_")) stripePaymentIntentId = String(obj.id);
-    }
-
-    // Fallbacks
-    if (!stripePaymentIntentId && obj.payment_intent) {
-      stripePaymentIntentId = String(obj.payment_intent);
-    }
-    // Some event objects may include a checkout_session pointer
-    if (!stripeCheckoutSessionId && obj.checkout_session) {
-      stripeCheckoutSessionId = String(obj.checkout_session);
-    }
-  }
-
+  // Store JSON payload for audit. If the table differs, this will fail and be caught upstream.
+  // If your schema is different, we will adjust after you show me \d aquorix.payment_events.
   const payload = JSON.stringify(event);
 
-  await pool.query(
+    await pool.query(
     `
     INSERT INTO aquorix.payment_events (
       event_id,
@@ -281,13 +260,12 @@ async function bestEffortInsertPaymentEvent(pool, event) {
       raw_event,
       received_at,
       processing_status,
-      stripe_checkout_session_id,
       stripe_payment_intent_id
     )
-    VALUES ($1, $2, $3::jsonb, NOW(), 'received', $4, $5)
+    VALUES ($1, $2, $3::jsonb, NOW(), 'received', $4)
     ON CONFLICT (event_id) DO NOTHING
     `,
-    [eventId, eventType, payload, stripeCheckoutSessionId, stripePaymentIntentId]
+    [eventId, eventType, payload, stripePaymentIntentId]
   );
 }
 

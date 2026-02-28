@@ -43,9 +43,10 @@
  * - 2026-02-25: v1.2.9 - Phase 8.3: Add success landing routes
  */
 
-require('dotenv').config();
+// Load local environment variables from .env (dev only)
+require("dotenv").config();
 
-const HOLD_WINDOW_MINUTES = Number(process.env.HOLD_WINDOW_MINUTES || 10);
+const HOLD_WINDOW_MINUTES = Number(process.env.HOLD_WINDOW_MINUTES || 15);
 
 const express = require('express');
 const cors = require('cors');
@@ -63,6 +64,8 @@ const registerBookingsPaymentLinkRoutes = require("./src/routes/bookingsPaymentL
 const registerDashboardBookingsRoutes = require("./src/routes/dashboardBookings");
 const registerDashboardBookingApproveRoutes = require("./src/routes/dashboardBookingApprove");
 const registerDashboardBookingRejectRoutes = require("./src/routes/dashboardBookingReject");
+
+const path = require('path');
 
 // -----------------------------------------------------------------------------
 // Phase 7 (Viking): Notifications + DB Notification Store
@@ -108,29 +111,21 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 app.use(express.json());
 
+app.use(express.static(path.join(__dirname, 'public')));
+
 // -----------------------------------------------------------------------------
 // Phase 8.3 (Local Dev): Stripe return landing endpoints
 // - Stripe Checkout success/cancel URLs may point here in local dev.
 // - These endpoints are intentionally simple and MUST NOT affect webhook truth.
 // -----------------------------------------------------------------------------
 app.get("/api/v1/stripe/success", (req, res) => {
-  const session_id = req.query && req.query.session_id ? String(req.query.session_id) : null;
-  res.status(200).json({
-    ok: true,
-    route: "/api/v1/stripe/success",
-    message: "Stripe Checkout returned successfully (webhook will confirm booking).",
-    stripe_checkout_session_id: session_id
-  });
+  const session_id = req.query && req.query.session_id ? String(req.query.session_id).trim() : "";
+  return res.redirect(302, `/success.html?session_id=${encodeURIComponent(session_id)}`);
 });
 
 app.get("/api/v1/stripe/cancel", (req, res) => {
-  const session_id = req.query && req.query.session_id ? String(req.query.session_id) : null;
-  res.status(200).json({
-    ok: true,
-    route: "/api/v1/stripe/cancel",
-    message: "Stripe Checkout was cancelled by the user (booking remains pending/unpaid).",
-    stripe_checkout_session_id: session_id
-  });
+  const session_id = req.query && req.query.session_id ? String(req.query.session_id).trim() : "";
+  return res.redirect(302, `/cancel.html?session_id=${encodeURIComponent(session_id)}`);
 });
 
 async function logDbFingerprint() {

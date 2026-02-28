@@ -37,6 +37,8 @@ module.exports = function registerDashboardBookingApproveRoutes(app, deps) {
       return res.status(400).json({ ok: false, status: "bad_request", message: "Invalid booking_id" });
     }
 
+    const forceNew = String(req.query.force_new || "").trim() === "1";
+
     // Env guardrails (explicit)
     const successUrl = process.env.STRIPE_SUCCESS_URL;
     const cancelUrl = process.env.STRIPE_CANCEL_URL;
@@ -111,7 +113,8 @@ module.exports = function registerDashboardBookingApproveRoutes(app, deps) {
       }
 
       // If we already created a checkout session before, return it (idempotent)
-      if (booking.stripe_checkout_session_id) {
+      // Unless force_new=1, which regenerates a fresh checkout session.
+      if (booking.stripe_checkout_session_id && !forceNew) {
         await client.query("COMMIT");
 
         const existingSession = await stripe.checkout.sessions.retrieve(String(booking.stripe_checkout_session_id));
@@ -123,6 +126,11 @@ module.exports = function registerDashboardBookingApproveRoutes(app, deps) {
           stripe_checkout_session_id: String(booking.stripe_checkout_session_id),
           checkout_url: existingSession && existingSession.url ? existingSession.url : null
         });
+      }
+
+      // forceNew path: treat as if no checkout exists (regenerate)
+      if (booking.stripe_checkout_session_id && forceNew) {
+        // Continue through creation flow below; we will overwrite stripe_checkout_session_id on the booking.
       }
 
       // 3) Must have session_id for capacity enforcement + checkout metadata integrity

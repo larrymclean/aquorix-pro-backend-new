@@ -18,13 +18,12 @@
  *
  * Author: Larry McLean
  * Created: 2026-02-25
- * Version: 1.0.1
+ * Version: 1.0.0
  *
  * Status: ACTIVE (Phase 8.3)
  *
  * Change Log (append-only):
  *   - 2026-02-25: v1.0.0 - Initial standard purchase endpoint: create booking + checkout immediately
- *   - 2026-02-26: v1.0.1 - Fix success/cancel URL so session_id is never missing
  */
 
 const { toMinorUnits, normalizeCurrency, minorToMajorDisplay } = require("../lib/money");
@@ -63,15 +62,6 @@ module.exports = function registerBookingsPurchaseRoutes(app, deps) {
     }
     if (!cancelUrl || !String(cancelUrl).trim()) {
       return res.status(500).json({ ok: false, status: "error", message: "STRIPE_CANCEL_URL missing from environment" });
-    }
-
-    function ensureCheckoutSessionIdParam(url) {
-      const u = String(url || "").trim();
-      if (!u) return u;
-      // If caller already provided the Stripe placeholder, do not alter.
-      if (u.includes("{CHECKOUT_SESSION_ID}")) return u;
-      const sep = u.includes("?") ? "&" : "?";
-      return `${u}${sep}session_id={CHECKOUT_SESSION_ID}`;
     }
 
     const body = (req && req.body) ? req.body : {};
@@ -418,13 +408,13 @@ module.exports = function registerBookingsPurchaseRoutes(app, deps) {
         });
       }
 
-      // ----------------------------------------------
+      // -----------------------------
       // 8) Create Stripe Checkout session immediately
-      // ----------------------------------------------
+      // -----------------------------
       const checkout = await stripe.checkout.sessions.create({
         mode: "payment",
-        success_url: ensureCheckoutSessionIdParam(successUrl),
-        cancel_url: ensureCheckoutSessionIdParam(cancelUrl),
+        success_url: String(successUrl),
+        cancel_url: String(cancelUrl),
         customer_email: String(guest_email),
         line_items: [
           {
@@ -453,9 +443,9 @@ module.exports = function registerBookingsPurchaseRoutes(app, deps) {
         return res.status(500).json({ ok: false, status: "error", message: "Stripe checkout did not return session id" });
       }
 
-      // ---------------------------------------------------------
+      // -----------------------------
       // 9) Persist checkout + FX info to booking (authoritative)
-      // ---------------------------------------------------------
+      // -----------------------------
       await client.query(
         `
         UPDATE aquorix.dive_bookings
