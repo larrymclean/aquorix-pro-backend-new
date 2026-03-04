@@ -116,6 +116,7 @@ function createPaymentsWebhookRouter({ pool }) {
  *   - If hold_expires_at < now => paid + manual_review_required, NOT confirmed
  *   - Else => paid + confirmed
  */
+
 async function handleCheckoutSessionCompleted({ pool, event }) {
   const session = event.data && event.data.object ? event.data.object : null;
   if (!session) throw new Error("checkout.session.completed missing session object");
@@ -138,6 +139,7 @@ async function handleCheckoutSessionCompleted({ pool, event }) {
       client,
       bookingIdFromMetadata,
       stripeCheckoutSessionId,
+      stripePaymentIntentId,
     });
 
     if (!booking) {
@@ -211,8 +213,13 @@ async function handleCheckoutSessionCompleted({ pool, event }) {
   }
 }
 
-async function loadBookingForUpdate({ client, bookingIdFromMetadata, stripeCheckoutSessionId }) {
-  // Prefer metadata booking_id if we have it
+async function loadBookingForUpdate({
+  client,
+  bookingIdFromMetadata,
+  stripeCheckoutSessionId,
+  stripePaymentIntentId,
+}) {
+  // 1) Prefer metadata booking_id if available
   if (bookingIdFromMetadata) {
     const r = await client.query(
       `
@@ -221,22 +228,40 @@ async function loadBookingForUpdate({ client, bookingIdFromMetadata, stripeCheck
        WHERE booking_id = $1
        FOR UPDATE
       `,
-      [bookingIdFromMetadata]
+      [String(bookingIdFromMetadata)]
     );
     if (r.rows && r.rows[0]) return r.rows[0];
   }
 
-  // Fallback: lookup by checkout session id
-  const r2 = await client.query(
-    `
-    SELECT *
-      FROM aquorix.dive_bookings
-     WHERE stripe_checkout_session_id = $1
-     FOR UPDATE
-    `,
-    [String(stripeCheckoutSessionId)]
-  );
-  return r2.rows && r2.rows[0] ? r2.rows[0] : null;
+  // 2) Fallback: lookup by Stripe checkout session id
+  if (stripeCheckoutSessionId) {
+    const r2 = await client.query(
+      `
+      SELECT *
+        FROM aquorix.dive_bookings
+       WHERE stripe_checkout_session_id = $1
+       FOR UPDATE
+      `,
+      [String(stripeCheckoutSessionId)]
+    );
+    if (r2.rows && r2.rows[0]) return r2.rows[0];
+  }
+
+  // 3) Final fallback: lookup by Stripe payment intent id
+  if (stripePaymentIntentId) {
+    const r3 = await client.query(
+      `
+      SELECT *
+        FROM aquorix.dive_bookings
+       WHERE stripe_payment_intent_id = $1
+       FOR UPDATE
+      `,
+      [String(stripePaymentIntentId)]
+    );
+    if (r3.rows && r3.rows[0]) return r3.rows[0];
+  }
+
+  return null;
 }
 
 /**
