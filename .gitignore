@@ -15,3 +15,4 @@ node_modules/
 # Local env (DO NOT COMMIT)
 .env
 .env.*
+_local_backups/
