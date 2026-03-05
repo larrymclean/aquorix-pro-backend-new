@@ -63,7 +63,9 @@ const registerBookingsPurchaseRoutes = require("./src/routes/bookingsPurchase");
 const registerBookingsPaymentLinkRoutes = require("./src/routes/bookingsPaymentLink");
 const registerDashboardBookingsRoutes = require("./src/routes/dashboardBookings");
 const registerDashboardBookingApproveRoutes = require("./src/routes/dashboardBookingApprove");
+const registerDashboardBookingApproveLatePaymentRoutes = require("./src/routes/dashboardBookingApproveLatePayment");
 const registerDashboardBookingRejectRoutes = require("./src/routes/dashboardBookingReject");
+const registerDashboardBookingRefundRoutes = require("./src/routes/dashboardBookingRefund");
 
 const path = require('path');
 
@@ -179,6 +181,19 @@ registerDashboardBookingApproveRoutes(app, {
   getStripeClient,
   getOperatorDefaultCapacity,
   getCapacityConsumedForSession
+});
+
+registerDashboardBookingApproveLatePaymentRoutes(app, {
+  pool,
+  requireDashboardScope,
+  getOperatorDefaultCapacity,
+  getCapacityConsumedForSession
+});
+
+registerDashboardBookingRefundRoutes(app, {
+  pool,
+  requireDashboardScope,
+  getStripeClient
 });
 
 registerDashboardBookingRejectRoutes(app, {

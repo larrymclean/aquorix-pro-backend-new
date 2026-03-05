@@ -1,0 +1,210 @@
+/*
+ * AQUORIX Backend — Dashboard Booking Approve Late Payment Route
+ * File: dashboardBookingApproveLatePayment.js
+ * Path: /Users/larrymclean/CascadeProjects/aquorix-backend/src/routes/dashboardBookingApproveLatePayment.js
+ * Description: Operator resolves strict-hold late payment cases (paid after hold expiry) by confirming booking
+ *
+ * Created: 2026-03-04
+ * Version: 1.0.0
+ *
+ * Change Log (append-only):
+ *   - 2026-03-04: v1.0.0 - NEW: POST /api/v1/dashboard/bookings/:booking_id/approve-late-payment (deterministic, auditable)
+ */
+
+module.exports = function registerDashboardBookingApproveLatePaymentRoutes(app, deps) {
+  const {
+    pool,
+    requireDashboardScope,
+    getOperatorDefaultCapacity,
+    getCapacityConsumedForSession
+  } = deps;
+
+  if (!app) throw new Error("registerDashboardBookingApproveLatePaymentRoutes: app is required");
+  if (!pool) throw new Error("registerDashboardBookingApproveLatePaymentRoutes: pool is required");
+  if (!requireDashboardScope) throw new Error("registerDashboardBookingApproveLatePaymentRoutes: requireDashboardScope is required");
+
+  if (!getOperatorDefaultCapacity) throw new Error("registerDashboardBookingApproveLatePaymentRoutes: getOperatorDefaultCapacity is required");
+  if (!getCapacityConsumedForSession) throw new Error("registerDashboardBookingApproveLatePaymentRoutes: getCapacityConsumedForSession is required");
+
+  // ---------------------------------------------------------------------------
+  // Phase 8.3: Resolve Late Payment Manual Review => Confirm Booking
+  // POST /api/v1/dashboard/bookings/:booking_id/approve-late-payment
+  //
+  // Preconditions (server enforced):
+  // - operator scoped
+  // - payment_status = 'paid'
+  // - booking_status = 'pending'
+  // - manual_review_required = true
+  // - manual_review_reason = 'payment_received_after_hold_expiry' (tight safety)
+  // ---------------------------------------------------------------------------
+  app.post("/api/v1/dashboard/bookings/:booking_id/approve-late-payment", requireDashboardScope, async (req, res) => {
+    const booking_id = Number(req.params.booking_id);
+    if (!Number.isFinite(booking_id) || booking_id <= 0) {
+      return res.status(400).json({ ok: false, status: "bad_request", message: "Invalid booking_id" });
+    }
+
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      // 1) Lock booking row (operator scoped)
+      const b = await client.query(
+        `
+        SELECT
+          booking_id,
+          operator_id,
+          session_id,
+          headcount,
+          booking_status,
+          payment_status,
+          manual_review_required,
+          manual_review_reason,
+          paid_at
+        FROM aquorix.dive_bookings
+        WHERE booking_id = $1
+          AND operator_id = $2
+        FOR UPDATE
+        `,
+        [booking_id, req.operator_id]
+      );
+
+      if (b.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, status: "not_found", message: "Booking not found" });
+      }
+
+      const booking = b.rows[0];
+
+      // 2) Idempotent terminal outcomes
+      if (booking.booking_status === "cancelled") {
+        await client.query("ROLLBACK");
+        return res.json({ ok: true, status: "success", action: "noop_already_cancelled", booking_id: String(booking_id) });
+      }
+
+      if (booking.booking_status === "confirmed") {
+        await client.query("ROLLBACK");
+        return res.json({ ok: true, status: "success", action: "noop_already_confirmed", booking_id: String(booking_id) });
+      }
+
+      // 3) Preconditions
+      if (booking.payment_status !== "paid") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          status: "conflict",
+          action: "conflict_not_paid",
+          message: "Booking is not paid; cannot approve late payment",
+          booking_id: String(booking_id)
+        });
+      }
+
+      if (booking.booking_status !== "pending") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          status: "conflict",
+          action: "conflict_not_pending",
+          message: "Booking is not pending; cannot approve late payment",
+          booking_id: String(booking_id),
+          booking_status: String(booking.booking_status)
+        });
+      }
+
+      if (!booking.manual_review_required) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          status: "conflict",
+          action: "conflict_not_in_manual_review",
+          message: "Booking is not in manual review; nothing to approve",
+          booking_id: String(booking_id)
+        });
+      }
+
+      if (String(booking.manual_review_reason || "") !== "payment_received_after_hold_expiry") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          status: "conflict",
+          action: "conflict_wrong_manual_review_reason",
+          message: "Manual review reason is not eligible for approve-late-payment",
+          booking_id: String(booking_id),
+          manual_review_reason: booking.manual_review_reason === null ? null : String(booking.manual_review_reason)
+        });
+      }
+
+      // 4) Capacity enforcement (OWNER LAW: confirmed must mean seat guaranteed)
+      const session_id = Number(booking.session_id);
+      if (!Number.isFinite(session_id) || session_id <= 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          status: "bad_request",
+          message: "Booking has no valid session_id; cannot approve late payment",
+          booking_id: String(booking_id)
+        });
+      }
+
+      const requested = Number(booking.headcount || 1);
+      if (!Number.isFinite(requested) || requested <= 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          ok: false,
+          status: "bad_request",
+          message: "Invalid headcount on booking; cannot approve late payment",
+          booking_id: String(booking_id)
+        });
+      }
+
+      const capacity = await getOperatorDefaultCapacity(req.operator_id);
+      const consumed = await getCapacityConsumedForSession(client, req.operator_id, session_id);
+
+      if (consumed + requested > capacity) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          ok: false,
+          status: "conflict",
+          action: "conflict_over_capacity",
+          message: "Over capacity for this session; cannot confirm late payment booking",
+          capacity,
+          capacity_consumed: consumed,
+          requested_headcount: requested,
+          booking_id: String(booking_id)
+        });
+      }
+
+      // 4) Confirm booking + clear manual review flags (deterministic)
+      await client.query(
+        `
+        UPDATE aquorix.dive_bookings
+           SET booking_status = 'confirmed',
+               manual_review_required = false,
+               manual_review_reason = NULL,
+               updated_at = NOW()
+         WHERE booking_id = $1
+           AND operator_id = $2
+        `,
+        [booking_id, req.operator_id]
+      );
+
+      await client.query("COMMIT");
+
+      return res.json({
+        ok: true,
+        status: "success",
+        action: "late_payment_approved_confirmed",
+        booking_id: String(booking_id),
+        server_time_utc: new Date().toISOString(),
+        contract_version: "v1"
+      });
+
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch (_) {}
+      console.error("[approve late payment] error:", e && e.stack ? e.stack : e);
+      return res.status(500).json({ ok: false, status: "error", message: "Internal server error" });
+    } finally {
+      client.release();
+    }
+  });
+};
