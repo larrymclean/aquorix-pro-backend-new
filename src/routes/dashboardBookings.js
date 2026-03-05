@@ -112,6 +112,9 @@ function registerDashboardBookingsRoutes(app, { pool, requireDashboardScope }) {
           b.booking_id,
           b.booking_status::text AS booking_status,
           b.payment_status::text AS payment_status,
+          refund_status,
+          refunded_at,
+          refund_reason,
           b.payment_currency,
           b.payment_amount_minor,
           b.payment_amount,
@@ -133,6 +136,7 @@ function registerDashboardBookingsRoutes(app, { pool, requireDashboardScope }) {
           END AS requires_manual_review_derived,
 
           CASE
+            WHEN b.refund_status = 'refunded' THEN 'refunded'  
             WHEN b.booking_status::text = 'cancelled' THEN 'cancelled'
             WHEN b.booking_status::text = 'confirmed'
                  AND b.payment_status::text = 'paid'
