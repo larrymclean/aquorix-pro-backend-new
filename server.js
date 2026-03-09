@@ -2,14 +2,14 @@
  * AQUORIX Pro Backend Server
  * File: server.js
  * Path: /Users/larrymclean/CascadeProjects/aquorix-backend/server.js
- * Description: Express server for AQUORIX Pro Dashboard + Public Widgets
+ * Description: Express server for AQUORIX Pro Dashboard, public booking flows, public widgets, and payment/webhook routing.
  *
  * Author: Larry McLean
  * Created: 2025-07-01
- * Version: 1.2.9
+ * Version: 1.3.0
  *
- * Last Updated: 2026-02-21
- * Status: ACTIVE (Local-first Dev / Phase 4-8)
+ * Last Updated: 2026-03-09
+ * Status: ACTIVE (Local-first Dev / Phase 9E)
  *
  * Change Log (append-only):
  *   - 2025-07-01: v1.0.0 - Initial setup with /api/health endpoint
@@ -40,7 +40,9 @@
  *   - 2026-02-21: v1.2.8 - Phase 8.1: Dual-currency policy (ledger JOD, charge USD) + FX estimate + store stripe_charge_* + fx_rate_* fields
  *   - 2026-02-21: v1.2.8 - Phase 8.1: Fix Postgres param typing for nullable FX fields (explicit casts)
  *   - 2026-02-21: v1.2.8 - Phase 8.1: Dual-currency Stripe Checkout (JOD ledger + USD charge) with FX estimate + minor-unit hardening (JOD=3, USD=2); store stripe_charge_* + fx_rate_* fields; approve endpoint returns ledger + charge amounts; idempotent checkout retrieval
- * - 2026-02-25: v1.2.9 - Phase 8.3: Add success landing routes
+ *   - 2026-02-25: v1.2.9 - Phase 8.3: Add success landing routes
+ *   - 2026-03-09: v1.3.0 - Phase 9E: Add public widget pending booking route registration
+ *   - 2026-03-09: v1.3.0 - Phase 9E: Extend local dev CORS allowlist for widget preview origins (4173 and 5173)
  */
 
 // Load local environment variables from .env (dev only)
@@ -61,11 +63,14 @@ const { createPaymentsWebhookRouter } = require("./src/routes/paymentsWebhook");
 const registerBookingsRequestRoutes = require("./src/routes/bookingsRequest");
 const registerBookingsPurchaseRoutes = require("./src/routes/bookingsPurchase");
 const registerBookingsPaymentLinkRoutes = require("./src/routes/bookingsPaymentLink");
+const registerWidgetBookingsPendingRoutes = require("./src/routes/widgetBookingsPending");
 const registerDashboardBookingsRoutes = require("./src/routes/dashboardBookings");
 const registerDashboardBookingApproveRoutes = require("./src/routes/dashboardBookingApprove");
 const registerDashboardBookingApproveLatePaymentRoutes = require("./src/routes/dashboardBookingApproveLatePayment");
 const registerDashboardBookingRejectRoutes = require("./src/routes/dashboardBookingReject");
 const registerDashboardBookingRefundRoutes = require("./src/routes/dashboardBookingRefund");
+const { registerLegacyScheduleRoutes } = require("./src/routes/schedule/legacySchedule.routes");
+const { registerSessionsRoutes } = require("./src/routes/sessions/sessions.routes");
 
 const path = require('path');
 
@@ -95,6 +100,8 @@ const ALLOWED_ORIGINS = new Set([
   "https://aquorix-frontend-dev.onrender.com",
   "http://localhost:3000",
   "http://localhost:3500",
+  "http://localhost:4173",
+  "http://localhost:5173",
 ]);
 
 const corsOptions = {
@@ -168,6 +175,16 @@ const requireAuthUser = requireAuthUserFactory({ pool });
 const requireDashboardScope = requireDashboardScopeFactory({ pool });
 
 // -----------------------------------------------------------------------------
+// Legacy Schedule Fixture Routes (Parity Oracle)
+// -----------------------------------------------------------------------------
+registerLegacyScheduleRoutes(app);
+
+// -----------------------------------------------------------------------------
+// Phase 9: Canonical Sessions API (Widget feed)
+// -----------------------------------------------------------------------------
+registerSessionsRoutes(app, { pool });
+
+// -----------------------------------------------------------------------------
 // Phase 8.3-B: Route Extraction - Booking Request
 // -----------------------------------------------------------------------------
 registerDashboardBookingsRoutes(app, {
@@ -213,6 +230,11 @@ registerBookingsRequestRoutes(app, {
   HOLD_WINDOW_MINUTES,
   notifications,
   notificationStore,
+});
+
+registerWidgetBookingsPendingRoutes(app, {
+  pool,
+  HOLD_WINDOW_MINUTES,
 });
 
 registerBookingsPurchaseRoutes(app, {

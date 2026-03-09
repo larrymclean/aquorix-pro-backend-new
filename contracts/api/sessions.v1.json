@@ -1,0 +1,41 @@
+{
+  "contract": "AQUORIX Sessions API",
+  "version": "v1",
+  "endpoint": "GET /api/v1/sessions",
+  "query_params": {
+    "operator_slug": "string (required)",
+    "week_start": "YYYY-MM-DD (optional; defaults to operator-local current week start)"
+  },
+  "notes": [
+    "This is the CANONICAL schedule feed for the React widget.",
+    "Legacy oracle remains at /api/v1/schedule/legacy/arab-divers for parity testing only.",
+    "Available space = available inventory (capacity_remaining)."
+  ],
+  "response_shape": {
+    "ok": "boolean",
+    "status": "success | error | bad_request | not_found",
+    "operator": {
+      "slug": "string",
+      "name": "string",
+      "timezone": "string",
+      "currency": "string | null"
+    },
+    "week": {
+      "start": "YYYY-MM-DD",
+      "end": "YYYY-MM-DD"
+    },
+    "sessions": [
+      {
+        "session_id": "string",
+        "session_date": "YYYY-MM-DD",
+        "day_of_week": "1..7 (ISO, Monday=1)",
+        "start_time": "HH:MM",
+        "meet_time": "HH:MM | null",
+        "site_name": "string",
+        "session_type": "string | null",
+        "capacity_total": "number | null",
+        "capacity_remaining": "number | null"
+      }
+    ]
+  }
+}
