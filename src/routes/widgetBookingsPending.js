@@ -110,6 +110,67 @@ module.exports = function registerWidgetBookingsPendingRoutes(app, deps) {
 
       const bookingId = `WIDGET-PENDING-${Date.now()}`;
 
+      // Resolve operator_id from operator_slug (Poseidon Law 15: operator context must be explicit)
+      const opResult = await pool.query(
+        `SELECT operator_id
+        FROM aquorix.diveoperators
+        WHERE operator_slug = $1
+        LIMIT 1`,
+        [operatorSlug]
+      );
+
+      if (!opResult.rows.length) {
+        return res.status(404).json({
+          ok: false,
+          error: "operator not found",
+          code: "OPERATOR_NOT_FOUND"
+        });
+      }
+
+      const operatorId = opResult.rows[0].operator_id;
+
+      const insertSql = `
+        INSERT INTO aquorix.dive_bookings (
+          operator_id,
+          session_id,
+          booking_status,
+          payment_status,
+          headcount,
+          guest_name,
+          guest_email,
+          guest_phone,
+          source,
+          hold_expires_at,
+          payment_amount_minor,
+          payment_currency
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
+        )
+        RETURNING booking_id
+      `;
+
+      const headcount = chargeableItems.reduce((sum, i) => sum + (i.pax || 1), 0);
+
+      const insertValues = [
+        operatorId,
+        null,
+        'pending',
+        'unpaid',
+        headcount,
+        `${firstName} ${lastName}`,
+        email,
+        phone,
+        bookingSource,
+        holdExpiresAt,
+        Number(totalMinorRaw),
+        currency
+      ];
+
+      const result = await pool.query(insertSql, insertValues);
+
+      const realBookingId = result.rows[0].booking_id;
+
       const pendingBookingRequest = {
         submittedAtIso,
         bookingSource,
@@ -141,7 +202,7 @@ module.exports = function registerWidgetBookingsPendingRoutes(app, deps) {
 
       return res.status(201).json({
         ok: true,
-        bookingId,
+        bookingId: realBookingId,
         bookingStatus: "PENDING_PAYMENT",
         paymentStatus: "unpaid",
         holdExpiresAt,
