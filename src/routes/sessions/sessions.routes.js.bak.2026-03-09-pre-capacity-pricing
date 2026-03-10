@@ -3,7 +3,7 @@
  *
  * File: /src/routes/sessions/sessions.routes.js
  * Path: /Users/larrymclean/CascadeProjects/aquorix-backend/src/routes/sessions/sessions.routes.js
- * Version: v1.1.0
+ * Version: v1.0.0
  * Created: 2026-03-05
  * Author: Larry McLean
  *
@@ -23,7 +23,6 @@
  *
  * Change Log (append-only):
  * - 2026-03-05: v1.0.0 - Initial canonical sessions read-only endpoint. [LM]
- * - 2026-03-09: v1.1.0 - Add pricing + capacity fields for widget booking truth. [LM]
  */
 
 function isValidYmd(value) {
@@ -33,19 +32,6 @@ function isValidYmd(value) {
   if (!yyyy || !mm || !dd) return false;
   const d = new Date(Date.UTC(yyyy, mm - 1, dd));
   return d.getUTCFullYear() === yyyy && d.getUTCMonth() === mm - 1 && d.getUTCDate() === dd;
-}
-
-function minorUnitMultiplier(currency) {
-  const c = String(currency || "").trim().toUpperCase();
-
-  switch (c) {
-    case "JOD":
-      return 1000;
-    case "USD":
-      return 100;
-    default:
-      return 100;
-  }
 }
 
 function registerSessionsRoutes(app, { pool }) {
@@ -81,13 +67,7 @@ function registerSessionsRoutes(app, { pool }) {
       // 1) Resolve operator
       const opResult = await pool.query(
         `
-        SELECT
-          operator_id,
-          operator_slug,
-          name,
-          timezone,
-          default_currency,
-          operator_default_capacity
+        SELECT operator_id, operator_slug, name, timezone, default_currency
         FROM aquorix.diveoperators
         WHERE operator_slug = $1
         LIMIT 1
@@ -130,7 +110,9 @@ function registerSessionsRoutes(app, { pool }) {
       const week_start = weekRange.rows[0].week_start;
       const week_end = weekRange.rows[0].week_end;
 
-      // 3) Fetch sessions (exclude cancelled) + compute consumed capacity
+      // 3) Fetch sessions (exclude cancelled)
+      // NOTE: capacity_total/capacity_remaining are returned as null for now.
+      // We will fill these in once we finalize capacity math for Phase 9.
       const sessionsResult = await pool.query(
         `
         SELECT
@@ -140,82 +122,28 @@ function registerSessionsRoutes(app, { pool }) {
           to_char((ds.dive_datetime AT TIME ZONE $4)::time, 'HH24:MI') AS start_time,
           to_char((ds.meet_time AT TIME ZONE $4)::time, 'HH24:MI') AS meet_time,
           dsite.name AS site_name,
-          ds.session_type,
-          ds.price_per_diver,
-          ds.session_currency,
-          COALESCE(SUM(
-            CASE
-              WHEN db.booking_status = 'confirmed' THEN db.headcount
-              WHEN db.booking_status = 'pending'
-               AND db.payment_status = 'unpaid'
-               AND db.hold_expires_at IS NOT NULL
-               AND db.hold_expires_at > NOW()
-              THEN db.headcount
-              ELSE 0
-            END
-          ), 0) AS consumed_capacity
+          ds.session_type
         FROM aquorix.dive_sessions ds
-        JOIN aquorix.divesites dsite
-          ON dsite.dive_site_id = ds.dive_site_id
-        LEFT JOIN aquorix.dive_bookings db
-          ON db.session_id = ds.session_id
+        JOIN aquorix.divesites dsite ON dsite.dive_site_id = ds.dive_site_id
         WHERE ds.operator_id = $1
           AND (ds.dive_datetime AT TIME ZONE $4)::date BETWEEN $2::date AND $3::date
           AND ds.cancelled_at IS NULL
-        GROUP BY
-          ds.session_id,
-          (ds.dive_datetime AT TIME ZONE $4)::date,
-          EXTRACT(ISODOW FROM (ds.dive_datetime AT TIME ZONE $4)),
-          to_char((ds.dive_datetime AT TIME ZONE $4)::time, 'HH24:MI'),
-          to_char((ds.meet_time AT TIME ZONE $4)::time, 'HH24:MI'),
-          dsite.name,
-          ds.session_type,
-          ds.price_per_diver,
-          ds.session_currency
         ORDER BY session_date ASC, start_time ASC
         `,
         [operator.operator_id, week_start, week_end, tz]
       );
 
-      const fallbackCapacityRaw = operator.operator_default_capacity;
-      const fallbackCapacity = Number.isFinite(Number(fallbackCapacityRaw))
-        ? Number(fallbackCapacityRaw)
-        : 0;
-
-      const sessions = sessionsResult.rows.map((r) => {
-        const currency = String(r.session_currency || operator.default_currency || "").trim().toUpperCase();
-        const multiplier = minorUnitMultiplier(currency);
-
-        const pricePerDiver = r.price_per_diver === null || r.price_per_diver === undefined
-          ? null
-          : String(r.price_per_diver);
-
-        const unitPriceMinor = pricePerDiver === null
-          ? null
-          : Math.round(Number(pricePerDiver) * multiplier);
-
-        const capacityTotal = fallbackCapacity > 0 ? fallbackCapacity : null;
-        const consumedCapacity = Number(r.consumed_capacity || 0);
-
-        const capacityRemaining = capacityTotal === null
-          ? null
-          : Math.max(capacityTotal - consumedCapacity, 0);
-
-        return {
-          session_id: String(r.session_id),
-          session_date: r.session_date,
-          day_of_week: Number(r.day_of_week),
-          start_time: r.start_time,
-          meet_time: r.meet_time || null,
-          site_name: r.site_name,
-          session_type: r.session_type || null,
-          session_currency: currency || null,
-          price_per_diver: pricePerDiver,
-          unit_price_minor: unitPriceMinor,
-          capacity_total: capacityTotal,
-          capacity_remaining: capacityRemaining
-        };
-      });
+      const sessions = sessionsResult.rows.map((r) => ({
+        session_id: String(r.session_id),
+        session_date: r.session_date,
+        day_of_week: Number(r.day_of_week),
+        start_time: r.start_time,
+        meet_time: r.meet_time || null,
+        site_name: r.site_name,
+        session_type: r.session_type || null,
+        capacity_total: null,
+        capacity_remaining: null
+      }));
 
       return res.json({
         ok: true,
@@ -224,8 +152,7 @@ function registerSessionsRoutes(app, { pool }) {
           slug: operator.operator_slug,
           name: operator.name,
           timezone: tz,
-          currency: operator.default_currency || null,
-          operator_default_capacity: fallbackCapacity > 0 ? fallbackCapacity : null
+          currency: operator.default_currency || null
         },
         week: { start: week_start, end: week_end },
         sessions

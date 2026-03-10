@@ -23,6 +23,7 @@ module.exports = function registerWidgetBookingsPendingRoutes(app, deps) {
   const {
     pool,
     HOLD_WINDOW_MINUTES,
+    getStripeClient,
   } = deps || {};
 
   if (!app) {
@@ -129,6 +130,44 @@ module.exports = function registerWidgetBookingsPendingRoutes(app, deps) {
 
       const operatorId = opResult.rows[0].operator_id;
 
+      const primarySessionIdRaw = chargeableItems[0]?.sessionId;
+
+      if (!primarySessionIdRaw) {
+        return res.status(400).json({
+          ok: false,
+          error: "sessionId is required",
+          code: "SESSION_ID_REQUIRED"
+        });
+      }
+
+      const primarySessionId = Number(primarySessionIdRaw);
+
+      if (!Number.isInteger(primarySessionId) || primarySessionId <= 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "sessionId must be a positive integer",
+          code: "SESSION_ID_INVALID"
+        });
+      }
+
+      // Poseidon Guardrail: verify session belongs to this operator
+      const sessionCheck = await pool.query(
+        `SELECT session_id
+        FROM aquorix.dive_sessions
+        WHERE session_id = $1
+        AND operator_id = $2
+        LIMIT 1`,
+        [primarySessionId, operatorId]
+      );
+
+      if (!sessionCheck.rows.length) {
+        return res.status(400).json({
+          ok: false,
+          error: "session does not belong to operator",
+          code: "SESSION_OPERATOR_MISMATCH"
+        });
+      }
+
       const insertSql = `
         INSERT INTO aquorix.dive_bookings (
           operator_id,
@@ -154,7 +193,7 @@ module.exports = function registerWidgetBookingsPendingRoutes(app, deps) {
 
       const insertValues = [
         operatorId,
-        null,
+        primarySessionId,
         'pending',
         'unpaid',
         headcount,

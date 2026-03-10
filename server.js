@@ -64,6 +64,7 @@ const registerBookingsRequestRoutes = require("./src/routes/bookingsRequest");
 const registerBookingsPurchaseRoutes = require("./src/routes/bookingsPurchase");
 const registerBookingsPaymentLinkRoutes = require("./src/routes/bookingsPaymentLink");
 const registerWidgetBookingsPendingRoutes = require("./src/routes/widgetBookingsPending");
+const registerWidgetCheckoutSessionRoutes = require("./src/routes/widgetCheckoutSession");
 const registerDashboardBookingsRoutes = require("./src/routes/dashboardBookings");
 const registerDashboardBookingApproveRoutes = require("./src/routes/dashboardBookingApprove");
 const registerDashboardBookingApproveLatePaymentRoutes = require("./src/routes/dashboardBookingApproveLatePayment");
@@ -235,6 +236,12 @@ registerBookingsRequestRoutes(app, {
 registerWidgetBookingsPendingRoutes(app, {
   pool,
   HOLD_WINDOW_MINUTES,
+  getStripeClient,
+});
+
+registerWidgetCheckoutSessionRoutes(app, {
+  pool,
+  getStripeClient,
 });
 
 registerBookingsPurchaseRoutes(app, {
